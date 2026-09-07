@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Union, Literal
 from pathlib import Path
 
 
+from ucloud_sandbox.domain_config import get_default_base_image
 from ucloud_sandbox.exceptions import BuildException, InvalidArgumentException
 from ucloud_sandbox.template.consts import STACK_TRACE_DEPTH, RESOLVE_SYMLINKS
 from ucloud_sandbox.template.dockerfile_parser import parse_dockerfile
@@ -787,7 +788,7 @@ class TemplateBase:
         :param file_context_path: Base path for resolving relative file paths in copy operations
         :param file_ignore_patterns: List of glob patterns to ignore when copying files
         """
-        self._default_base_image: str = "uhub.service.ucloud.cn/agentbox/e2bdev/base:latest"
+        self._default_base_image: str = get_default_base_image()
         self._base_image: Optional[str] = self._default_base_image
         self._base_template: Optional[str] = None
         self._registry_config: Optional[RegistryConfig] = None
