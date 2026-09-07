@@ -35,6 +35,12 @@ from .connection_config import (
     ProxyTypes,
     Username,
 )
+from .domain_config import (
+    get_default_base_image,
+    get_ucloud_sandbox_domain,
+    get_ucloud_sandbox_region,
+    is_region_cn,
+)
 from .volume.connection_config import VolumeApiParams, VolumeConnectionConfig
 from .exceptions import (
     AuthenticationException,
@@ -149,6 +155,11 @@ __all__ = [
     "ApiParams",
     "VolumeApiParams",
     "Username",
+    # Domain config
+    "get_ucloud_sandbox_domain",
+    "get_ucloud_sandbox_region",
+    "get_default_base_image",
+    "is_region_cn",
     # Exceptions
     "SandboxException",
     "TimeoutException",

@@ -1,5 +1,7 @@
 import os
 
+from typing import Optional
+
 
 DEFAULT_REGION = "cn-wlcb"
 DEFAULT_DOMAIN = f"{DEFAULT_REGION}.sandbox.ucloudai.com"
@@ -24,8 +26,21 @@ def get_ucloud_sandbox_domain() -> str:
     return os.getenv(DOMAIN_ENV_VAR) or DEFAULT_DOMAIN
 
 
+def is_region_cn(region: Optional[str] = None) -> bool:
+    """
+    Whether the region is a CN region.
+
+    :param region: Region to check, defaults to the currently configured region
+    :return: `True` for regions starting with "cn" or "gray"
+    """
+    if region is None:
+        region = get_ucloud_sandbox_region()
+
+    return region.strip().lower().startswith(CN_REGION_PREFIXES)
+
+
 def get_default_base_image() -> str:
-    if get_ucloud_sandbox_region().lower().startswith(CN_REGION_PREFIXES):
+    if is_region_cn():
         return CN_BASE_IMAGE
 
     return DEFAULT_BASE_IMAGE
