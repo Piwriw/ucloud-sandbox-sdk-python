@@ -1,7 +1,7 @@
 import logging
 import httpx
 
-from typing import Optional, Dict, overload, Union, List
+from typing import cast, Optional, Dict, overload, Union, List
 from httpx import Client
 from ucloud_sandbox import Sandbox as BaseSandbox, InvalidArgumentException
 from ucloud_sandbox.api.client_sync import get_transport
@@ -58,7 +58,24 @@ class Sandbox(BaseSandbox):
 
     @property
     def _jupyter_url(self) -> str:
+        # Honors the `sandbox_url` option and the `UCLOUD_SANDBOX_URL` environment
+        # variable, same as the base SDK does for envd requests.
+        sandbox_url = cast(Optional[str], self.connection_config._sandbox_url)
+        if sandbox_url:
+            return sandbox_url
         return self.get_url(JUPYTER_PORT)
+
+    def _jupyter_request_url(self, path: str) -> str:
+        url = f"{self._jupyter_url}{path}"
+        source = getattr(self.connection_config, "request_source", None)
+        if not source:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}source={source}"
+
+    @property
+    def _include_diagnostics(self) -> bool:
+        return getattr(self.connection_config, "request_source", None) == "ci"
 
     @property
     def _client(self) -> Client:
@@ -189,7 +206,11 @@ class Sandbox(BaseSandbox):
         context_id = context.id if context else None
 
         try:
-            headers: Dict[str, str] = {"Content-Type": "application/json"}
+            headers: Dict[str, str] = {
+                "Content-Type": "application/json",
+                "E2b-Sandbox-Id": self.sandbox_id,
+                "E2b-Sandbox-Port": str(JUPYTER_PORT),
+            }
             if self._envd_access_token:
                 headers["X-Access-Token"] = self._envd_access_token
             if self.traffic_access_token:
@@ -197,7 +218,7 @@ class Sandbox(BaseSandbox):
 
             with self._client.stream(
                 "POST",
-                f"{self._jupyter_url}/execute",
+                self._jupyter_request_url("/execute"),
                 json={
                     "code": code,
                     "context_id": context_id,
@@ -205,9 +226,24 @@ class Sandbox(BaseSandbox):
                     "env_vars": envs,
                 },
                 headers=headers,
-                timeout=(request_timeout, timeout, request_timeout, request_timeout),
+                # `timeout` bounds the execution, `request_timeout` only the
+                # connect. Every non-connect phase must carry `timeout`: the
+                # SDK's pyqwest-backed transport collapses the per-phase
+                # timeouts into a single whole-request deadline and takes the
+                # longest of them, so leaving `request_timeout` on the write
+                # and pool phases would raise the floor to
+                # `max(timeout, request_timeout)` and silently ignore any
+                # `timeout` shorter than it. This matches the JS SDK, which
+                # aborts the execution on a `timeout`-long timer.
+                # `timeout=0` disables the deadline entirely; the transport
+                # still bounds connect on its own.
+                timeout=(
+                    httpx.Timeout(timeout, connect=request_timeout)
+                    if timeout is not None
+                    else httpx.Timeout(None)
+                ),
             ) as response:
-                err = extract_exception(response)
+                err = extract_exception(response, self._include_diagnostics)
                 if err:
                     raise err
 
@@ -256,20 +292,22 @@ class Sandbox(BaseSandbox):
             data["cwd"] = cwd
 
         try:
-            headers: Dict[str, str] = {"Content-Type": "application/json"}
-            if self._envd_access_token:
-                headers["X-Access-Token"] = self._envd_access_token
+            headers: Dict[str, str] = {
+                "Content-Type": "application/json",
+                "E2b-Sandbox-Id": self.sandbox_id,
+                "E2b-Sandbox-Port": str(JUPYTER_PORT),
+            }
             if self.traffic_access_token:
                 headers["E2B-Traffic-Access-Token"] = self.traffic_access_token
 
             response = self._client.post(
-                f"{self._jupyter_url}/contexts",
+                self._jupyter_request_url("/contexts"),
                 json=data,
                 headers=headers,
                 timeout=request_timeout or self.connection_config.request_timeout,
             )
 
-            err = extract_exception(response)
+            err = extract_exception(response, self._include_diagnostics)
             if err:
                 raise err
 
@@ -295,19 +333,21 @@ class Sandbox(BaseSandbox):
         context_id = context.id if isinstance(context, Context) else context
 
         try:
-            headers: Dict[str, str] = {"Content-Type": "application/json"}
-            if self._envd_access_token:
-                headers["X-Access-Token"] = self._envd_access_token
+            headers: Dict[str, str] = {
+                "Content-Type": "application/json",
+                "E2b-Sandbox-Id": self.sandbox_id,
+                "E2b-Sandbox-Port": str(JUPYTER_PORT),
+            }
             if self.traffic_access_token:
                 headers["E2B-Traffic-Access-Token"] = self.traffic_access_token
 
             response = self._client.delete(
-                f"{self._jupyter_url}/contexts/{context_id}",
+                self._jupyter_request_url(f"/contexts/{context_id}"),
                 headers=headers,
                 timeout=self.connection_config.request_timeout,
             )
 
-            err = extract_exception(response)
+            err = extract_exception(response, self._include_diagnostics)
             if err:
                 raise err
         except httpx.TimeoutException:
@@ -323,19 +363,21 @@ class Sandbox(BaseSandbox):
         :return: List of contexts.
         """
         try:
-            headers: Dict[str, str] = {"Content-Type": "application/json"}
-            if self._envd_access_token:
-                headers["X-Access-Token"] = self._envd_access_token
+            headers: Dict[str, str] = {
+                "Content-Type": "application/json",
+                "E2b-Sandbox-Id": self.sandbox_id,
+                "E2b-Sandbox-Port": str(JUPYTER_PORT),
+            }
             if self.traffic_access_token:
                 headers["E2B-Traffic-Access-Token"] = self.traffic_access_token
 
             response = self._client.get(
-                f"{self._jupyter_url}/contexts",
+                self._jupyter_request_url("/contexts"),
                 headers=headers,
                 timeout=self.connection_config.request_timeout,
             )
 
-            err = extract_exception(response)
+            err = extract_exception(response, self._include_diagnostics)
             if err:
                 raise err
 
@@ -361,19 +403,21 @@ class Sandbox(BaseSandbox):
         context_id = context.id if isinstance(context, Context) else context
 
         try:
-            headers: Dict[str, str] = {"Content-Type": "application/json"}
-            if self._envd_access_token:
-                headers["X-Access-Token"] = self._envd_access_token
+            headers: Dict[str, str] = {
+                "Content-Type": "application/json",
+                "E2b-Sandbox-Id": self.sandbox_id,
+                "E2b-Sandbox-Port": str(JUPYTER_PORT),
+            }
             if self.traffic_access_token:
                 headers["E2B-Traffic-Access-Token"] = self.traffic_access_token
 
             response = self._client.post(
-                f"{self._jupyter_url}/contexts/{context_id}/restart",
+                self._jupyter_request_url(f"/contexts/{context_id}/restart"),
                 headers=headers,
                 timeout=self.connection_config.request_timeout,
             )
 
-            err = extract_exception(response)
+            err = extract_exception(response, self._include_diagnostics)
             if err:
                 raise err
         except httpx.TimeoutException:

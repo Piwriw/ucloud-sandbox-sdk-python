@@ -48,6 +48,10 @@ def _parse_response(
         response_404 = Error.from_dict(response.json())
 
         return response_404
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -76,7 +80,9 @@ def sync_detailed(
     start: Union[Unset, int] = UNSET,
     limit: Union[Unset, int] = 1000,
 ) -> Response[Union[Error, SandboxLogs]]:
-    """Get sandbox logs. Use /v2/sandboxes/{sandboxID}/logs instead.
+    """Sandbox logs
+
+     Get sandbox logs. Use /v2/sandboxes/{sandboxID}/logs instead.
 
     Args:
         sandbox_id (str):
@@ -111,7 +117,9 @@ def sync(
     start: Union[Unset, int] = UNSET,
     limit: Union[Unset, int] = 1000,
 ) -> Optional[Union[Error, SandboxLogs]]:
-    """Get sandbox logs. Use /v2/sandboxes/{sandboxID}/logs instead.
+    """Sandbox logs
+
+     Get sandbox logs. Use /v2/sandboxes/{sandboxID}/logs instead.
 
     Args:
         sandbox_id (str):
@@ -141,7 +149,9 @@ async def asyncio_detailed(
     start: Union[Unset, int] = UNSET,
     limit: Union[Unset, int] = 1000,
 ) -> Response[Union[Error, SandboxLogs]]:
-    """Get sandbox logs. Use /v2/sandboxes/{sandboxID}/logs instead.
+    """Sandbox logs
+
+     Get sandbox logs. Use /v2/sandboxes/{sandboxID}/logs instead.
 
     Args:
         sandbox_id (str):
@@ -174,7 +184,9 @@ async def asyncio(
     start: Union[Unset, int] = UNSET,
     limit: Union[Unset, int] = 1000,
 ) -> Optional[Union[Error, SandboxLogs]]:
-    """Get sandbox logs. Use /v2/sandboxes/{sandboxID}/logs instead.
+    """Sandbox logs
+
+     Get sandbox logs. Use /v2/sandboxes/{sandboxID}/logs instead.
 
     Args:
         sandbox_id (str):

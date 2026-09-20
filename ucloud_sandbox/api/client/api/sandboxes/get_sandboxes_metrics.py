@@ -46,6 +46,10 @@ def _parse_response(
         response_401 = Error.from_dict(response.json())
 
         return response_401
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -72,7 +76,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     sandbox_ids: list[str],
 ) -> Response[Union[Error, SandboxesWithMetrics]]:
-    """List metrics for given sandboxes
+    """List sandbox metrics
+
+     List metrics for given sandboxes
 
     Args:
         sandbox_ids (list[str]):
@@ -101,7 +107,9 @@ def sync(
     client: AuthenticatedClient,
     sandbox_ids: list[str],
 ) -> Optional[Union[Error, SandboxesWithMetrics]]:
-    """List metrics for given sandboxes
+    """List sandbox metrics
+
+     List metrics for given sandboxes
 
     Args:
         sandbox_ids (list[str]):
@@ -125,7 +133,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     sandbox_ids: list[str],
 ) -> Response[Union[Error, SandboxesWithMetrics]]:
-    """List metrics for given sandboxes
+    """List sandbox metrics
+
+     List metrics for given sandboxes
 
     Args:
         sandbox_ids (list[str]):
@@ -152,7 +162,9 @@ async def asyncio(
     client: AuthenticatedClient,
     sandbox_ids: list[str],
 ) -> Optional[Union[Error, SandboxesWithMetrics]]:
-    """List metrics for given sandboxes
+    """List sandbox metrics
+
+     List metrics for given sandboxes
 
     Args:
         sandbox_ids (list[str]):

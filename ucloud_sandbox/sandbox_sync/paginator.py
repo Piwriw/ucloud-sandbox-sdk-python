@@ -7,9 +7,10 @@ from ucloud_sandbox.api import handle_api_exception
 from ucloud_sandbox.api.client.api.sandboxes import get_v2_sandboxes
 from ucloud_sandbox.api.client.api.snapshots import get_snapshots
 from ucloud_sandbox.api.client.models.error import Error
+from ucloud_sandbox.api.client.models.order_direction import OrderDirection
 from ucloud_sandbox.api.client.types import UNSET
-from ucloud_sandbox.connection_config import ApiParams, ConnectionConfig
-from ucloud_sandbox.exceptions import SandboxException
+from ucloud_sandbox.connection_config import ApiParams, ConnectionConfig, merge_api_params
+from ucloud_sandbox.exceptions import InvalidArgumentException, SandboxException
 from ucloud_sandbox.sandbox.sandbox_api import (
     SandboxPaginatorBase,
     SandboxInfo,
@@ -41,7 +42,7 @@ class SandboxPaginator(SandboxPaginatorBase):
 
         :param opts: Per-call connection options (e.g. `api_key`, `domain`,
             `headers`, `request_timeout`). When provided, this call uses these
-            options instead of the ones the paginator was constructed with.
+            options on top of the ones the paginator was constructed with.
 
         :returns: List of sandboxes
         """
@@ -57,12 +58,31 @@ class SandboxPaginator(SandboxPaginatorBase):
             }
             metadata = urllib.parse.urlencode(quoted_metadata)
 
-        config = ConnectionConfig(**{**self._opts, **opts})
+        if self.order is None:
+            order = UNSET
+        else:
+            try:
+                order = OrderDirection(self.order)
+            except ValueError:
+                raise InvalidArgumentException(
+                    f"Invalid order {self.order!r}, expected 'asc' or 'desc'"
+                )
+
+        config = ConnectionConfig(**merge_api_params(self._opts, opts))
         api_client = get_api_client(config)
         res = get_v2_sandboxes.sync_detailed(
             client=api_client,
             metadata=metadata if metadata else UNSET,
             state=self.query.state if self.query and self.query.state else UNSET,
+            started_after=(
+                self.query.started_after.astimezone()
+                if self.query and self.query.started_after
+                else UNSET
+            ),
+            template=(
+                self.query.template if self.query and self.query.template else UNSET
+            ),
+            order=order,
             limit=self.limit if self.limit else UNSET,
             next_token=self._next_token if self._next_token else UNSET,
         )
@@ -70,8 +90,7 @@ class SandboxPaginator(SandboxPaginatorBase):
         if res.status_code >= 300:
             raise handle_api_exception(res)
 
-        self._next_token = res.headers.get("x-next-token")
-        self._has_next = bool(self._next_token)
+        self._update_pagination(res.headers)
 
         if res.parsed is None:
             return []
@@ -105,18 +124,19 @@ class SnapshotPaginator(SnapshotPaginatorBase):
 
         :param opts: Per-call connection options (e.g. `api_key`, `domain`,
             `headers`, `request_timeout`). When provided, this call uses these
-            options instead of the ones the paginator was constructed with.
+            options on top of the ones the paginator was constructed with.
 
         :returns: List of snapshots
         """
         if not self.has_next:
             raise Exception("No more items to fetch")
 
-        config = ConnectionConfig(**{**self._opts, **opts})
+        config = ConnectionConfig(**merge_api_params(self._opts, opts))
         api_client = get_api_client(config)
         res = get_snapshots.sync_detailed(
             client=api_client,
             sandbox_id=self.sandbox_id if self.sandbox_id else UNSET,
+            name=self.name if self.name else UNSET,
             limit=self.limit if self.limit else UNSET,
             next_token=self._next_token if self._next_token else UNSET,
         )
@@ -124,8 +144,7 @@ class SnapshotPaginator(SnapshotPaginatorBase):
         if res.status_code >= 300:
             raise handle_api_exception(res)
 
-        self._next_token = res.headers.get("x-next-token")
-        self._has_next = bool(self._next_token)
+        self._update_pagination(res.headers)
 
         if res.parsed is None:
             return []

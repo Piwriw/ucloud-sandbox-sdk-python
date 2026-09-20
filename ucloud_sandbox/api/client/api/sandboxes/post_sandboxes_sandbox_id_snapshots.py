@@ -6,9 +6,7 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
-from ...models.post_sandboxes_sandbox_id_snapshots_body import (
-    PostSandboxesSandboxIDSnapshotsBody,
-)
+from ...models.sandbox_snapshot_request import SandboxSnapshotRequest
 from ...models.snapshot_info import SnapshotInfo
 from ...types import Response
 
@@ -16,7 +14,7 @@ from ...types import Response
 def _get_kwargs(
     sandbox_id: str,
     *,
-    body: PostSandboxesSandboxIDSnapshotsBody,
+    body: SandboxSnapshotRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -52,6 +50,10 @@ def _parse_response(
         response_404 = Error.from_dict(response.json())
 
         return response_404
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -77,14 +79,16 @@ def sync_detailed(
     sandbox_id: str,
     *,
     client: AuthenticatedClient,
-    body: PostSandboxesSandboxIDSnapshotsBody,
+    body: SandboxSnapshotRequest,
 ) -> Response[Union[Error, SnapshotInfo]]:
-    """Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new
+    """Create snapshot
+
+     Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new
     sandboxes and persist beyond the original sandbox's lifetime.
 
     Args:
         sandbox_id (str):
-        body (PostSandboxesSandboxIDSnapshotsBody):
+        body (SandboxSnapshotRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -110,14 +114,16 @@ def sync(
     sandbox_id: str,
     *,
     client: AuthenticatedClient,
-    body: PostSandboxesSandboxIDSnapshotsBody,
+    body: SandboxSnapshotRequest,
 ) -> Optional[Union[Error, SnapshotInfo]]:
-    """Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new
+    """Create snapshot
+
+     Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new
     sandboxes and persist beyond the original sandbox's lifetime.
 
     Args:
         sandbox_id (str):
-        body (PostSandboxesSandboxIDSnapshotsBody):
+        body (SandboxSnapshotRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -138,14 +144,16 @@ async def asyncio_detailed(
     sandbox_id: str,
     *,
     client: AuthenticatedClient,
-    body: PostSandboxesSandboxIDSnapshotsBody,
+    body: SandboxSnapshotRequest,
 ) -> Response[Union[Error, SnapshotInfo]]:
-    """Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new
+    """Create snapshot
+
+     Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new
     sandboxes and persist beyond the original sandbox's lifetime.
 
     Args:
         sandbox_id (str):
-        body (PostSandboxesSandboxIDSnapshotsBody):
+        body (SandboxSnapshotRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -169,14 +177,16 @@ async def asyncio(
     sandbox_id: str,
     *,
     client: AuthenticatedClient,
-    body: PostSandboxesSandboxIDSnapshotsBody,
+    body: SandboxSnapshotRequest,
 ) -> Optional[Union[Error, SnapshotInfo]]:
-    """Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new
+    """Create snapshot
+
+     Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new
     sandboxes and persist beyond the original sandbox's lifetime.
 
     Args:
         sandbox_id (str):
-        body (PostSandboxesSandboxIDSnapshotsBody):
+        body (SandboxSnapshotRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

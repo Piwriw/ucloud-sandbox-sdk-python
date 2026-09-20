@@ -1,14 +1,40 @@
+import logging
 import os
+import re
 
-from typing import cast, Optional, Dict, TypedDict
+from typing import cast, Mapping, Optional, Dict, TypedDict, Union
 
-from httpx._types import ProxyTypes
+import httpx
 from typing_extensions import Unpack
 
+from ucloud_sandbox.retry import resolve_max_retries
 from ucloud_sandbox.api.metadata import package_version
 from ucloud_sandbox.domain_config import get_ucloud_sandbox_domain
 
+ProxyTypes = Union[str, httpx.URL, httpx.Proxy]
+"""The forms the ``proxy`` option accepts: a URL string, an ``httpx.URL``, or
+an ``httpx.Proxy``.
+
+Identical to ``httpx._types.ProxyTypes``, spelled out here so the SDK doesn't
+import httpx's private module at runtime — and so the union can grow a pyqwest
+proxy type as the transports move off httpx. :func:`e2b.api.proxy_to_config`
+narrows it to what the pyqwest REST transports take.
+"""
+
 REQUEST_TIMEOUT: float = 60.0  # 60 seconds
+DEFAULT_RETRIES = 3
+
+# Idle bound for every read on the streaming envd file-transfer transport:
+# the transfer is aborted when no bytes at all arrive for this long. It
+# resets on each chunk, so it never limits total transfer time — only a
+# fully stalled stream. Matches the previous default stream idle timeout
+# (the request timeout).
+#
+# Kept equal to `e2b.volume.connection_config.READ_TIMEOUT` on purpose: the
+# read bound is part of the transport cache key, so the volume streaming pool
+# and the sandbox-filesystem streaming pool are the same reqwest pool only
+# while the two constants agree. Change one and they silently split in two.
+READ_TIMEOUT: float = 60.0  # 60 seconds
 
 KEEPALIVE_PING_INTERVAL_SEC = 50  # 50 seconds
 KEEPALIVE_PING_HEADER = "Keepalive-Ping-Interval"
@@ -24,23 +50,28 @@ class ApiParams(TypedDict, total=False):
     request_timeout: Optional[float]
     """Timeout for the request in **seconds**, defaults to 60 seconds."""
 
+    retries: Optional[int]
+    """Number of control-plane HTTP retries after a 429 with a valid,
+    non-negative integer delta-seconds ``Retry-After`` header. HTTP-date and
+    malformed values are not retried.
+    A retry is skipped when its wait would exhaust the request timeout.
+    Retry waits use a 60-second total limit when request timeouts are disabled.
+    Set to ``0`` to disable retries. Defaults to 3 retries.
+
+    :raises InvalidArgumentException: if the value is negative or not an integer."""
+
     headers: Optional[Dict[str, str]]
     """Additional headers to send with the request. Deprecated, use api_headers instead."""
 
     api_headers: Optional[Dict[str, str]]
     """Additional headers to send with UCloud Sandbox API requests."""
 
-    integration: Optional[str]
-    """Integration wrapping the UCloud Sandbox SDK, appended to the User-Agent."""
-
     api_key: Optional[str]
     """UCloud Sandbox API Key to use for authentication, defaults to `UCLOUD_SANDBOX_API_KEY` environment variable."""
 
     validate_api_key: Optional[bool]
-    """Whether to validate the format of the UCloud Sandbox API key on the client side.
-    Disable this when your deployment issues API keys that don't match the
-    validation is disabled by default. Set `UCLOUD_SANDBOX_VALIDATE_API_KEY=true`
-    to enable a non-empty API key check."""
+    """Deprecated: the API key format is no longer validated on the client side;
+    this option has no effect."""
 
     domain: Optional[str]
     """UCloud Sandbox domain to use for authentication, defaults to `UCLOUD_SANDBOX_REGION`, `UCLOUD_SANDBOX_DOMAIN`, or the default UCloud Sandbox domain."""
@@ -61,12 +92,92 @@ class ApiParams(TypedDict, total=False):
     """Whether to use HTTP instead of HTTPS, defaults to `UCLOUD_SANDBOX_INSECURE_HTTP`."""
 
 
+class ApiParamsWithLogger(ApiParams, total=False):
+    """:class:`ApiParams` plus the construction-time ``logger``.
+
+    Internal type returned by :meth:`ConnectionConfig.get_api_params` so that the
+    logger a sandbox was created/connected with keeps propagating to the
+    throwaway ``ConnectionConfig`` that instance control-plane methods rebuild.
+    Unlike :class:`ApiParams`, ``logger`` is not a public per-request option.
+    """
+
+    logger: Optional[logging.Logger]
+
+
+def merge_api_params(
+    bound_params: Optional[ApiParams], params: Mapping[str, object]
+) -> ApiParams:
+    """
+    Merge the API params bound to a class (e.g. by an :class:`ucloud_sandbox.UCloudSandbox` client)
+    with the per-call params. Per-call params win, then the bound params, then
+    the environment variables resolved by :class:`ConnectionConfig`.
+
+    Per-call params explicitly set to ``None`` are dropped so they fall back to
+    the bound params instead of clearing them.
+
+    :meta private:
+    """
+    if not bound_params:
+        return cast(ApiParams, params)
+
+    merged = cast(Dict[str, object], dict(bound_params))
+    merged.update({k: v for k, v in params.items() if v is not None})
+    return cast(ApiParams, merged)
+
+
+class ClientFactory:
+    """
+    Base class for the resource classes (`Sandbox`, `Volume`, `Template`,
+    `Secret`) whose classmethods build a :class:`ConnectionConfig` from per-call
+    params. An :class:`ucloud_sandbox.UCloudSandbox` client exposes subclasses of these with its own
+    params bound, and every classmethod resolves them through
+    :meth:`_resolve_api_params`.
+
+    :meta private:
+    """
+
+    _bound_api_params: ApiParams = {}
+    """API params bound to this class by an :class:`ucloud_sandbox.UCloudSandbox` client.
+
+    Empty on the base classes, so the env-configured default path is unchanged.
+
+    :meta private:
+    """
+
+    @classmethod
+    def _resolve_api_params(cls, **opts: Unpack[ApiParams]) -> ApiParams:
+        """
+        Merge the API params bound to this class with the per-call params.
+
+        :meta private:
+        """
+        return merge_api_params(cls._bound_api_params, opts)
+
+
 class ConnectionConfig:
     """
     Configuration for the connection to the API.
     """
 
     envd_port = 49983
+
+    _integration: Optional[str] = None
+
+    @classmethod
+    def set_integration(cls, integration: Optional[str]) -> None:
+        """
+        Identify traffic from an integration wrapping the UCloud Sandbox SDK by appending
+        ``integration`` (e.g. ``"e2b-code-interpreter/0.1.0"``) to the
+        ``User-Agent`` header of every request.
+
+        Call once at startup, before any ``ConnectionConfig`` is constructed —
+        configs read the value at construction time. Pass ``None`` to clear.
+
+        Internal use only — not part of the public, stable API.
+
+        :meta private:
+        """
+        ConnectionConfig._integration = integration
 
     @staticmethod
     def _domain():
@@ -81,10 +192,6 @@ class ConnectionConfig:
         return os.getenv("UCLOUD_SANDBOX_API_KEY")
 
     @staticmethod
-    def _validate_api_key():
-        return os.getenv("UCLOUD_SANDBOX_VALIDATE_API_KEY", "false").lower() == "true"
-
-    @staticmethod
     def _api_url():
         return os.getenv("UCLOUD_SANDBOX_API_URL")
 
@@ -97,19 +204,43 @@ class ConnectionConfig:
         return os.getenv("UCLOUD_SANDBOX_INSECURE_HTTP", "false").lower() == "true"
 
     @staticmethod
-    def _access_token():
-        return os.getenv("UCLOUD_SANDBOX_ACCESS_TOKEN")
+    def _get_request_source() -> Optional[str]:
+        source = os.getenv("UCLOUD_SANDBOX_USER_AGENT_SOURCE")
+        if source and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", source):
+            return source
+        return None
 
     @staticmethod
-    def _build_user_agent(
-        integration: Optional[str] = None,
-    ) -> str:
+    def _build_user_agent(request_source: Optional[str] = None) -> str:
         user_agent_parts = [f"ucloud-agentbox-sdk/{package_version}"]
 
-        if integration:
-            user_agent_parts.append(integration)
+        if ConnectionConfig._integration:
+            user_agent_parts.append(ConnectionConfig._integration)
+
+        if request_source:
+            user_agent_parts.append(f"source/{request_source}")
 
         return " ".join(user_agent_parts)
+
+    def _apply_user_agent(
+        self,
+        headers: Dict[str, str],
+        user_agent_override: Optional[str],
+    ) -> bool:
+        """
+        Set the ``User-Agent`` on ``headers``: an explicitly provided value
+        always wins; otherwise the SDK-built one, tagged with the current
+        integration.
+
+        Returns whether the SDK-built value was applied, so callers can keep
+        it in sync with the current integration on later rebuilds.
+        """
+        if user_agent_override is not None:
+            headers["User-Agent"] = user_agent_override
+            return False
+
+        headers["User-Agent"] = self._build_user_agent(self.request_source)
+        return True
 
     def __init__(
         self,
@@ -120,42 +251,39 @@ class ConnectionConfig:
         api_url: Optional[str] = None,
         sandbox_url: Optional[str] = None,
         insecure_http: Optional[bool] = None,
-        access_token: Optional[str] = None,
         request_timeout: Optional[float] = None,
         headers: Optional[Dict[str, str]] = None,
         api_headers: Optional[Dict[str, str]] = None,
-        integration: Optional[str] = None,
         extra_sandbox_headers: Optional[Dict[str, str]] = None,
         proxy: Optional[ProxyTypes] = None,
+        logger: Optional[logging.Logger] = None,
+        *,
+        retries: Optional[int] = None,
     ):
+        self.logger = logger
         self.domain = domain or ConnectionConfig._domain()
         self.debug = debug if debug is not None else ConnectionConfig._debug()
         self.api_key = api_key or ConnectionConfig._api_key()
-        self.validate_api_key = (
-            validate_api_key
-            if validate_api_key is not None
-            else ConnectionConfig._validate_api_key()
-        )
-        # Deprecated: pass the token through `api_headers` instead, e.g.
-        # api_headers={"Authorization": f"Bearer {token}"}.
-        self.access_token = access_token or ConnectionConfig._access_token()
-        self.integration = integration
+        self.validate_api_key = validate_api_key
+        self.request_source = ConnectionConfig._get_request_source()
         self.headers = {**(headers or {}), **(api_headers or {})}
-        self.headers["User-Agent"] = self._build_user_agent(
-            self.integration,
+        self._user_agent_is_sdk_built = self._apply_user_agent(
+            self.headers,
+            self.headers.get("User-Agent"),
         )
         self.__extra_sandbox_headers = extra_sandbox_headers or {}
 
         self.proxy = proxy
+        self.retries = resolve_max_retries(
+            retries if retries is not None else DEFAULT_RETRIES
+        )
 
         self.request_timeout = ConnectionConfig._get_request_timeout(
             REQUEST_TIMEOUT,
             request_timeout,
         )
 
-        self._sandbox_url: Optional[str] = (
-            sandbox_url or ConnectionConfig._sandbox_url()
-        )
+        self._sandbox_url: Optional[str] = sandbox_url or ConnectionConfig._sandbox_url()
         self.insecure_http = (
             True
             if self.debug
@@ -229,7 +357,6 @@ class ConnectionConfig:
         Get the parameters for the API call.
 
         This is used to avoid passing the following attributes to the API call:
-        - access_token
         - api_url
 
         It also returns a copy, so the original object is not modified.
@@ -238,7 +365,6 @@ class ConnectionConfig:
         """
         headers = opts.get("headers")
         api_headers = opts.get("api_headers")
-        integration = opts.get("integration", self.integration)
         request_timeout = opts.get("request_timeout")
         api_key = opts.get("api_key")
         validate_api_key = opts.get("validate_api_key")
@@ -248,19 +374,28 @@ class ConnectionConfig:
         proxy = opts.get("proxy")
         sandbox_url = opts.get("sandbox_url")
         insecure_http = opts.get("insecure_http")
+        retries = opts.get("retries")
 
         req_headers = self.headers.copy()
         if headers is not None:
             req_headers.update(headers)
         if api_headers is not None:
             req_headers.update(api_headers)
-        if integration is not None:
-            req_headers["User-Agent"] = self._build_user_agent(
-                integration,
+        if self._user_agent_is_sdk_built:
+            # Same precedence as the merge above: api_headers wins over headers.
+            per_call_user_agent = {**(headers or {}), **(api_headers or {})}.get(
+                "User-Agent"
             )
+            self._apply_user_agent(req_headers, per_call_user_agent)
 
+        # `logger` is a construction-time option rather than a per-request
+        # ApiParams field, but it must propagate to the throwaway
+        # ConnectionConfig that instance control-plane methods (kill, pause,
+        # set_timeout, get_info, connect, ...) rebuild from these params, so
+        # those requests keep logging with the logger the sandbox was created
+        # or connected with.
         return dict(
-            ApiParams(
+            ApiParamsWithLogger(
                 api_key=api_key if api_key is not None else self.api_key,
                 validate_api_key=(
                     validate_api_key
@@ -272,7 +407,6 @@ class ConnectionConfig:
                 debug=debug if debug is not None else self.debug,
                 request_timeout=self.get_request_timeout(request_timeout),
                 headers=req_headers,
-                integration=integration,
                 proxy=proxy if proxy is not None else self.proxy,
                 sandbox_url=(
                     sandbox_url
@@ -280,8 +414,12 @@ class ConnectionConfig:
                     else cast(Optional[str], self._sandbox_url)
                 ),
                 insecure_http=(
-                    insecure_http if insecure_http is not None else self.insecure_http
+                    insecure_http
+                    if insecure_http is not None
+                    else self.insecure_http
                 ),
+                logger=self.logger,
+                retries=retries if retries is not None else self.retries,
             )
         )
 

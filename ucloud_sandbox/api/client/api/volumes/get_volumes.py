@@ -35,6 +35,10 @@ def _parse_response(
         response_401 = Error.from_dict(response.json())
 
         return response_401
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -60,7 +64,9 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Union[Error, list["Volume"]]]:
-    """List all team volumes
+    """List team volumes
+
+     List all team volumes
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -83,7 +89,9 @@ def sync(
     *,
     client: AuthenticatedClient,
 ) -> Optional[Union[Error, list["Volume"]]]:
-    """List all team volumes
+    """List team volumes
+
+     List all team volumes
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -102,7 +110,9 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Union[Error, list["Volume"]]]:
-    """List all team volumes
+    """List team volumes
+
+     List all team volumes
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -123,7 +133,9 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
 ) -> Optional[Union[Error, list["Volume"]]]:
-    """List all team volumes
+    """List team volumes
+
+     List all team volumes
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

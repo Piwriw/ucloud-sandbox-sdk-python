@@ -1,3 +1,4 @@
+import logging
 import time
 from re import search as re_search
 from shlex import quote as quote_string
@@ -10,6 +11,10 @@ from ucloud_sandbox import (
     CommandResult,
     TimeoutException,
     CommandExitException,
+    SandboxIamOpts,
+    SandboxLifecycle,
+    SandboxNetworkOpts,
+    Volume,
 )
 from ucloud_sandbox.connection_config import ApiParams
 from typing_extensions import Self, Unpack
@@ -219,6 +224,11 @@ class Sandbox(SandboxBase):
         envs: Optional[Dict[str, str]] = None,
         secure: bool = True,
         allow_internet_access: bool = True,
+        network: Optional[SandboxNetworkOpts] = None,
+        iam: Optional[SandboxIamOpts] = None,
+        lifecycle: Optional[SandboxLifecycle] = None,
+        volume_mounts: Optional[Dict[str, Union[Volume, str]]] = None,
+        logger: Optional[logging.Logger] = None,
         **opts: Unpack[ApiParams],
     ) -> Self:
         """
@@ -255,26 +265,38 @@ class Sandbox(SandboxBase):
             envs=envs,
             secure=secure,
             allow_internet_access=allow_internet_access,
+            network=network,
+            iam=iam,
+            lifecycle=lifecycle,
+            volume_mounts=volume_mounts,
+            logger=logger,
             **opts,
         )
 
-        sbx._display = display
-        width, height = resolution or (1024, 768)
-        xvfb_handle = sbx.commands.run(
-            f"Xvfb {display} -ac -screen 0 {width}x{height}x24"
-            f" -retro -dpi {dpi or 96} -nolisten tcp -nolisten unix",
-            background=True,
-            timeout=0,
-        )
-        xvfb_handle.disconnect()
+        try:
+            sbx._display = display
+            width, height = resolution or (1024, 768)
+            xvfb_handle = sbx.commands.run(
+                f"Xvfb {display} -ac -screen 0 {width}x{height}x24"
+                f" -retro -dpi {dpi or 96} -nolisten tcp -nolisten unix",
+                background=True,
+                timeout=0,
+            )
+            xvfb_handle.disconnect()
 
-        if not sbx._wait_and_verify(
-            f"xdpyinfo -display {display}", lambda r: r.exit_code == 0
-        ):
-            raise TimeoutException("Could not start Xvfb")
+            if not sbx._wait_and_verify(
+                f"xdpyinfo -display {display}", lambda r: r.exit_code == 0
+            ):
+                raise TimeoutException("Could not start Xvfb")
 
-        sbx.__vnc_server = _VNCServer(sbx)
-        sbx._start_xfce4()
+            sbx.__vnc_server = _VNCServer(sbx)
+            sbx._start_xfce4()
+        except Exception:
+            try:
+                sbx.kill()
+            except Exception:
+                pass
+            raise
 
         return sbx
 
@@ -291,7 +313,7 @@ class Sandbox(SandboxBase):
                 if on_result(self.commands.run(cmd)):
                     return True
             except CommandExitException:
-                continue
+                pass
 
             time.sleep(interval)
             elapsed += interval
@@ -311,6 +333,13 @@ class Sandbox(SandboxBase):
             self._last_xfce4_pid = xfce4_handle.pid
             xfce4_handle.disconnect()
 
+        if not self._wait_and_verify(
+            "pgrep -x xfce4-session >/dev/null && pgrep -x xfwm4 >/dev/null && pgrep -x xfdesktop >/dev/null",
+            lambda r: r.exit_code == 0,
+            60,
+        ):
+            raise TimeoutException("Could not start XFCE")
+
     @property
     def stream(self) -> _VNCServer:
         return self.__vnc_server
@@ -324,7 +353,7 @@ class Sandbox(SandboxBase):
     @overload
     def screenshot(
         self,
-        format: Literal["bytes"],
+        format: Literal["bytes"] = "bytes",
     ) -> bytearray:
         """
         Take a screenshot and return it as a bytearray.

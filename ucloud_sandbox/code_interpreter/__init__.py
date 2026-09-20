@@ -1,4 +1,5 @@
 from ucloud_sandbox import *
+from .client import UCloudSandbox, UCloudSandboxClientParams
 from .code_interpreter_sync import Sandbox
 from .code_interpreter_async import AsyncSandbox
 from .models import (

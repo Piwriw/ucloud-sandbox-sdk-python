@@ -57,6 +57,10 @@ def _parse_response(
         response_404 = Error.from_dict(response.json())
 
         return response_404
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -87,7 +91,9 @@ def sync_detailed(
     limit: Union[Unset, int] = 100,
     level: Union[Unset, LogLevel] = UNSET,
 ) -> Response[Union[Error, TemplateBuildInfo]]:
-    """Get template build info
+    """Template build status
+
+     Get template build info
 
     Args:
         template_id (str):
@@ -128,7 +134,9 @@ def sync(
     limit: Union[Unset, int] = 100,
     level: Union[Unset, LogLevel] = UNSET,
 ) -> Optional[Union[Error, TemplateBuildInfo]]:
-    """Get template build info
+    """Template build status
+
+     Get template build info
 
     Args:
         template_id (str):
@@ -164,7 +172,9 @@ async def asyncio_detailed(
     limit: Union[Unset, int] = 100,
     level: Union[Unset, LogLevel] = UNSET,
 ) -> Response[Union[Error, TemplateBuildInfo]]:
-    """Get template build info
+    """Template build status
+
+     Get template build info
 
     Args:
         template_id (str):
@@ -203,7 +213,9 @@ async def asyncio(
     limit: Union[Unset, int] = 100,
     level: Union[Unset, LogLevel] = UNSET,
 ) -> Optional[Union[Error, TemplateBuildInfo]]:
-    """Get template build info
+    """Template build status
+
+     Get template build info
 
     Args:
         template_id (str):

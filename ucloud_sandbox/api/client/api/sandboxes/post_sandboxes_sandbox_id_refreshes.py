@@ -6,16 +6,14 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
-from ...models.post_sandboxes_sandbox_id_refreshes_body import (
-    PostSandboxesSandboxIDRefreshesBody,
-)
+from ...models.sandbox_refresh_request import SandboxRefreshRequest
 from ...types import Response
 
 
 def _get_kwargs(
     sandbox_id: str,
     *,
-    body: PostSandboxesSandboxIDRefreshesBody,
+    body: SandboxRefreshRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -46,6 +44,10 @@ def _parse_response(
         response_404 = Error.from_dict(response.json())
 
         return response_404
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -67,13 +69,15 @@ def sync_detailed(
     sandbox_id: str,
     *,
     client: AuthenticatedClient,
-    body: PostSandboxesSandboxIDRefreshesBody,
+    body: SandboxRefreshRequest,
 ) -> Response[Union[Any, Error]]:
-    """Refresh the sandbox extending its time to live
+    """Refresh sandbox
+
+     Refresh the sandbox extending its time to live
 
     Args:
         sandbox_id (str):
-        body (PostSandboxesSandboxIDRefreshesBody):
+        body (SandboxRefreshRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -99,13 +103,15 @@ def sync(
     sandbox_id: str,
     *,
     client: AuthenticatedClient,
-    body: PostSandboxesSandboxIDRefreshesBody,
+    body: SandboxRefreshRequest,
 ) -> Optional[Union[Any, Error]]:
-    """Refresh the sandbox extending its time to live
+    """Refresh sandbox
+
+     Refresh the sandbox extending its time to live
 
     Args:
         sandbox_id (str):
-        body (PostSandboxesSandboxIDRefreshesBody):
+        body (SandboxRefreshRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -126,13 +132,15 @@ async def asyncio_detailed(
     sandbox_id: str,
     *,
     client: AuthenticatedClient,
-    body: PostSandboxesSandboxIDRefreshesBody,
+    body: SandboxRefreshRequest,
 ) -> Response[Union[Any, Error]]:
-    """Refresh the sandbox extending its time to live
+    """Refresh sandbox
+
+     Refresh the sandbox extending its time to live
 
     Args:
         sandbox_id (str):
-        body (PostSandboxesSandboxIDRefreshesBody):
+        body (SandboxRefreshRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -156,13 +164,15 @@ async def asyncio(
     sandbox_id: str,
     *,
     client: AuthenticatedClient,
-    body: PostSandboxesSandboxIDRefreshesBody,
+    body: SandboxRefreshRequest,
 ) -> Optional[Union[Any, Error]]:
-    """Refresh the sandbox extending its time to live
+    """Refresh sandbox
+
+     Refresh the sandbox extending its time to live
 
     Args:
         sandbox_id (str):
-        body (PostSandboxesSandboxIDRefreshesBody):
+        body (SandboxRefreshRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

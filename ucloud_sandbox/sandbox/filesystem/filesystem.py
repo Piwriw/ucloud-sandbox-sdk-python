@@ -1,13 +1,19 @@
+import asyncio
 import gzip
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from io import IOBase, TextIOBase
-from typing import IO, Dict, Optional, Union, TypedDict
+from typing import IO, AsyncIterator, Dict, Iterator, List, Optional, Union, TypedDict
 
-from ucloud_sandbox.envd.filesystem import filesystem_pb2
+import httpx
+
+from protobuf.wkt import Timestamp
+
+from ucloud_sandbox.envd.filesystem import filesystem_pb
 from ucloud_sandbox.exceptions import InvalidArgumentException
+from ucloud_sandbox.io_utils import agzip_iter, aiter_io_chunks, gzip_iter, iter_io_chunks
 
 
 class FileType(Enum):
@@ -23,13 +29,19 @@ class FileType(Enum):
     """
     Filesystem object is a directory.
     """
+    SYMLINK = "symlink"
+    """
+    Filesystem object is a symlink.
+    """
 
 
-def map_file_type(ft: filesystem_pb2.FileType):
-    if ft == filesystem_pb2.FileType.FILE_TYPE_FILE:
+def map_file_type(ft: filesystem_pb.FileType):
+    if ft == filesystem_pb.FileType.FILE:
         return FileType.FILE
-    elif ft == filesystem_pb2.FileType.FILE_TYPE_DIRECTORY:
+    elif ft == filesystem_pb.FileType.DIRECTORY:
         return FileType.DIR
+    elif ft == filesystem_pb.FileType.SYMLINK:
+        return FileType.SYMLINK
 
 
 def map_file_type_str(value: Optional[str]) -> Optional[FileType]:
@@ -115,7 +127,7 @@ class EntryInfo(WriteInfo):
     """
 
 
-def map_entry_info(entry: filesystem_pb2.EntryInfo) -> EntryInfo:
+def map_entry_info(entry: filesystem_pb.EntryInfo) -> EntryInfo:
     return EntryInfo(
         name=entry.name,
         type=map_file_type(entry.type),
@@ -125,10 +137,10 @@ def map_entry_info(entry: filesystem_pb2.EntryInfo) -> EntryInfo:
         permissions=entry.permissions,
         owner=entry.owner,
         group=entry.group,
-        modified_time=entry.modified_time.ToDatetime(tzinfo=timezone.utc),
-        # Optional, we can't directly access symlink_target otherwise it will be "" instead of None
+        modified_time=(entry.modified_time or Timestamp()).to_datetime(),
+        # Optional scalar: unset reads as "" — presence check keeps it None
         symlink_target=(
-            entry.symlink_target if entry.HasField("symlink_target") else None
+            entry.symlink_target if entry.has_field("symlink_target") else None
         ),
         metadata=map_metadata(entry.metadata),
     )
@@ -143,11 +155,122 @@ class WriteEntry(TypedDict):
     data: Union[str, bytes, IO]
 
 
+class FileStreamReader(Iterator[bytes]):
+    """Iterator over a streamed file download.
+
+    Returned by ``Sandbox.files.read(format="stream")``. It owns the underlying
+    HTTP response and releases its pooled connection as soon as the stream is
+    fully consumed, an error is raised while reading (including the idle-read
+    timeout, which raises ``httpx.ReadTimeout``), or the reader is closed.
+
+    There is no garbage-collection safety net, so always consume it fully, use
+    it as a context manager, or call :meth:`close`::
+
+        with sandbox.files.read(path, format="stream") as stream:
+            for chunk in stream:
+                ...
+    """
+
+    def __init__(self, response: httpx.Response):
+        self._response = response
+        self._iterator = response.iter_bytes()
+        self._closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        return self
+
+    def __next__(self) -> bytes:
+        try:
+            return next(self._iterator)
+        except BaseException:
+            # Covers normal end (StopIteration) and read errors alike.
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Release the underlying HTTP connection. Safe to call multiple times."""
+        if self._closed:
+            return
+        self._closed = True
+        self._response.close()
+
+    def __enter__(self) -> "FileStreamReader":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+
+class AsyncFileStreamReader(AsyncIterator[bytes]):
+    """Async iterator over a streamed file download.
+
+    Returned by ``AsyncSandbox.files.read(format="stream")``. It owns the
+    underlying HTTP response and releases its pooled connection as soon as the
+    stream is fully consumed, an error is raised while reading (including the
+    idle-read timeout, which raises ``httpx.ReadTimeout``), or the reader is
+    closed.
+
+    There is no garbage-collection safety net (releasing an async connection
+    requires awaiting ``aclose()``, which a finalizer cannot do reliably), so
+    always consume it fully, use it as an async context manager, or call
+    :meth:`aclose`::
+
+        async with await sandbox.files.read(path, format="stream") as stream:
+            async for chunk in stream:
+                ...
+    """
+
+    def __init__(self, response: httpx.Response, idle_timeout: Optional[float] = None):
+        self._response = response
+        self._iterator = response.aiter_bytes()
+        # An explicit per-call idle bound, applied around each read with
+        # `wait_for` (the transport-wide idle read timeout covers the
+        # default case; see the flavor `read` implementations).
+        self._idle_timeout = idle_timeout
+        self._closed = False
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            read = self._iterator.__anext__()
+            if self._idle_timeout:
+                return await asyncio.wait_for(read, self._idle_timeout)
+            return await read
+        except asyncio.TimeoutError as e:
+            # `wait_for`'s expiry; keep the documented httpx exception. The
+            # transport's own idle read timeout already arrives as one.
+            await self.aclose()
+            raise httpx.ReadTimeout(str(e)) from e
+        except BaseException:
+            # Covers normal end (StopAsyncIteration) and read errors alike.
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        """Release the underlying HTTP connection. Safe to call multiple times."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._response.aclose()
+
+    async def __aenter__(self) -> "AsyncFileStreamReader":
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        await self.aclose()
+
+
 def _to_httpx_file(file_path: str, file_data: Union[str, bytes, IO]):
     """Build an httpx multipart `("file", (name, data))` tuple for the upload."""
     if isinstance(file_data, (str, bytes)):
         return ("file", (file_path, file_data))
     elif isinstance(file_data, TextIOBase):
+        # httpx raises TypeError for text-mode objects in a multipart field, so
+        # reading it here is what lets the multipart path accept one at all —
+        # at the cost of buffering. The octet-stream path streams it instead,
+        # which is why a file-like entry defaults to that path.
         return ("file", (file_path, file_data.read()))
     elif isinstance(file_data, IOBase):
         return ("file", (file_path, file_data))
@@ -155,23 +278,63 @@ def _to_httpx_file(file_path: str, file_data: Union[str, bytes, IO]):
         raise InvalidArgumentException(f"Unsupported data type for file {file_path}")
 
 
+def multipart_body_is_streamed(files: List[WriteEntry]) -> bool:
+    """Whether the multipart body built from ``files`` streams any entry.
+
+    Only binary file-like data is handed to httpx as a stream:
+    :func:`_to_httpx_file` reads text file-like data into memory first, because
+    httpx rejects text-mode objects in a multipart field ("Multipart file
+    uploads must be opened in binary mode"). Those uploads therefore stay
+    bounded by the request timeout, like ``str``/``bytes`` ones. Compare
+    ``to_upload_body``, which streams text and binary alike on the
+    octet-stream path (``iter_io_chunks`` encodes the chunks)."""
+    return any(
+        isinstance(file["data"], IOBase) and not isinstance(file["data"], TextIOBase)
+        for file in files
+    )
+
+
 def to_upload_body(
     data: Union[str, bytes, IO],
     use_gzip: bool = False,
-) -> bytes:
-    """Prepare file data for upload, optionally gzip-compressed."""
-    if isinstance(data, str):
-        raw = data.encode("utf-8")
-    elif isinstance(data, bytes):
-        raw = data
-    elif isinstance(data, TextIOBase):
-        raw = data.read().encode("utf-8")
-    elif isinstance(data, IOBase):
-        raw = data.read()
+) -> Union[bytes, IO, Iterator[bytes]]:
+    """Prepare file data for upload, optionally gzip-compressed.
+
+    File-like objects are streamed in chunks instead of being buffered in
+    memory.
+    """
+    if isinstance(data, (str, bytes)):
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        return gzip.compress(raw) if use_gzip else raw
+    elif isinstance(data, (TextIOBase, IOBase)):
+        if use_gzip:
+            return gzip_iter(iter_io_chunks(data))
+        if isinstance(data, TextIOBase):
+            # Text-mode IO yields str chunks—encode them while streaming.
+            return iter_io_chunks(data)
+        # httpx streams binary file-like objects in chunks without buffering.
+        return data
     else:
         raise InvalidArgumentException(f"Unsupported data type: {type(data)}")
 
-    return gzip.compress(raw) if use_gzip else raw
+
+def to_upload_body_async(
+    data: Union[str, bytes, IO],
+    use_gzip: bool = False,
+) -> Union[bytes, AsyncIterator[bytes]]:
+    """Prepare file data for upload with async httpx, optionally gzip-compressed.
+
+    File-like objects are streamed in chunks instead of being buffered in
+    memory. Async httpx requires an async iterable for streamed request bodies.
+    """
+    if isinstance(data, (str, bytes)):
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        return gzip.compress(raw) if use_gzip else raw
+    elif isinstance(data, (TextIOBase, IOBase)):
+        chunks = aiter_io_chunks(data)
+        return agzip_iter(chunks) if use_gzip else chunks
+    else:
+        raise InvalidArgumentException(f"Unsupported data type: {type(data)}")
 
 
 METADATA_HEADER_PREFIX = "X-Metadata-"

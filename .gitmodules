@@ -1,9 +1,3 @@
-[submodule "e2b"]
+[submodule "upstream/e2b"]
 	path = upstream/e2b
 	url = https://github.com/e2b-dev/E2B.git
-[submodule "upstream/code-interpreter"]
-	path = upstream/code-interpreter
-	url = https://github.com/e2b-dev/code-interpreter.git
-[submodule "upstream/desktop"]
-	path = upstream/desktop
-	url = https://github.com/e2b-dev/desktop.git

@@ -13,12 +13,15 @@ from ...types import UNSET, Response, Unset
 def _get_kwargs(
     *,
     sandbox_id: Union[Unset, str] = UNSET,
+    name: Union[Unset, str] = UNSET,
     limit: Union[Unset, int] = 100,
     next_token: Union[Unset, str] = UNSET,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {}
 
     params["sandboxID"] = sandbox_id
+
+    params["name"] = name
 
     params["limit"] = limit
 
@@ -51,6 +54,10 @@ def _parse_response(
         response_401 = Error.from_dict(response.json())
 
         return response_401
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -76,13 +83,17 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     sandbox_id: Union[Unset, str] = UNSET,
+    name: Union[Unset, str] = UNSET,
     limit: Union[Unset, int] = 100,
     next_token: Union[Unset, str] = UNSET,
 ) -> Response[Union[Error, list["SnapshotInfo"]]]:
-    """List all snapshots for the team
+    """List snapshots
+
+     List all snapshots for the team
 
     Args:
         sandbox_id (Union[Unset, str]): Filter snapshots by source sandbox ID
+        name (Union[Unset, str]):
         limit (Union[Unset, int]):  Default: 100.
         next_token (Union[Unset, str]):
 
@@ -96,6 +107,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         sandbox_id=sandbox_id,
+        name=name,
         limit=limit,
         next_token=next_token,
     )
@@ -111,13 +123,17 @@ def sync(
     *,
     client: AuthenticatedClient,
     sandbox_id: Union[Unset, str] = UNSET,
+    name: Union[Unset, str] = UNSET,
     limit: Union[Unset, int] = 100,
     next_token: Union[Unset, str] = UNSET,
 ) -> Optional[Union[Error, list["SnapshotInfo"]]]:
-    """List all snapshots for the team
+    """List snapshots
+
+     List all snapshots for the team
 
     Args:
         sandbox_id (Union[Unset, str]): Filter snapshots by source sandbox ID
+        name (Union[Unset, str]):
         limit (Union[Unset, int]):  Default: 100.
         next_token (Union[Unset, str]):
 
@@ -132,6 +148,7 @@ def sync(
     return sync_detailed(
         client=client,
         sandbox_id=sandbox_id,
+        name=name,
         limit=limit,
         next_token=next_token,
     ).parsed
@@ -141,13 +158,17 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     sandbox_id: Union[Unset, str] = UNSET,
+    name: Union[Unset, str] = UNSET,
     limit: Union[Unset, int] = 100,
     next_token: Union[Unset, str] = UNSET,
 ) -> Response[Union[Error, list["SnapshotInfo"]]]:
-    """List all snapshots for the team
+    """List snapshots
+
+     List all snapshots for the team
 
     Args:
         sandbox_id (Union[Unset, str]): Filter snapshots by source sandbox ID
+        name (Union[Unset, str]):
         limit (Union[Unset, int]):  Default: 100.
         next_token (Union[Unset, str]):
 
@@ -161,6 +182,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         sandbox_id=sandbox_id,
+        name=name,
         limit=limit,
         next_token=next_token,
     )
@@ -174,13 +196,17 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     sandbox_id: Union[Unset, str] = UNSET,
+    name: Union[Unset, str] = UNSET,
     limit: Union[Unset, int] = 100,
     next_token: Union[Unset, str] = UNSET,
 ) -> Optional[Union[Error, list["SnapshotInfo"]]]:
-    """List all snapshots for the team
+    """List snapshots
+
+     List all snapshots for the team
 
     Args:
         sandbox_id (Union[Unset, str]): Filter snapshots by source sandbox ID
+        name (Union[Unset, str]):
         limit (Union[Unset, int]):  Default: 100.
         next_token (Union[Unset, str]):
 
@@ -196,6 +222,7 @@ async def asyncio(
         await asyncio_detailed(
             client=client,
             sandbox_id=sandbox_id,
+            name=name,
             limit=limit,
             next_token=next_token,
         )

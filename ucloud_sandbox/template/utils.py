@@ -1,14 +1,14 @@
 import hashlib
 import os
-import io
 import tarfile
+import tempfile
 import json
 import stat
 from wcmatch import glob
 import re
 import inspect
 from types import TracebackType, FrameType
-from typing import List, Optional, Union
+from typing import IO, List, Optional, Union
 
 from ucloud_sandbox.exceptions import TemplateException
 from ucloud_sandbox.template.consts import BASE_STEP_NAME, FINALIZE_STEP_NAME
@@ -259,32 +259,49 @@ def tar_file_stream(
     file_context_path: str,
     ignore_patterns: List[str],
     resolve_symlinks: bool,
-) -> io.BytesIO:
+    gzip: bool,
+) -> IO[bytes]:
     """
-    Create a tar stream of files matching a pattern.
+    Create a tar archive of files matching a pattern in a temporary file.
+
+    The archive is spooled to disk so it can be uploaded as a stream instead
+    of being buffered in memory. The temporary file is deleted when closed.
 
     :param file_name: Glob pattern for files to include
     :param file_context_path: Base directory for resolving file paths
     :param ignore_patterns: Ignore patterns
     :param resolve_symlinks: Whether to resolve symbolic links
+    :param gzip: Whether to gzip the archive
 
-    :return: Tar stream
+    :return: Binary file object positioned at the start of the archive
     """
-    tar_buffer = io.BytesIO()
-    with tarfile.open(
-        fileobj=tar_buffer,
-        mode="w:gz",
-        dereference=resolve_symlinks,
-    ) as tar:
-        files = get_all_files_in_path(
-            file_name, file_context_path, ignore_patterns, True
-        )
-        for file in files:
-            tar.add(
-                file, arcname=os.path.relpath(file, file_context_path), recursive=False
+    tar_file = tempfile.TemporaryFile()
+    try:
+        with tarfile.open(
+            fileobj=tar_file,
+            mode="w:gz" if gzip else "w",
+            dereference=resolve_symlinks,
+        ) as tar:
+            files = get_all_files_in_path(
+                file_name, file_context_path, ignore_patterns, True
             )
+            for file in files:
+                tar.add(
+                    file,
+                    arcname=os.path.relpath(file, file_context_path),
+                    recursive=False,
+                )
 
-    return tar_buffer
+        tar_file.seek(0)
+        return tar_file
+    except Exception:
+        # Best-effort cleanup: a close failure must not replace the real
+        # archive-creation error.
+        try:
+            tar_file.close()
+        except Exception:
+            pass
+        raise
 
 
 def strip_ansi_escape_codes(text: str) -> str:
@@ -299,45 +316,68 @@ def strip_ansi_escape_codes(text: str) -> str:
     """
     # Valid string terminator sequences are BEL, ESC\, and 0x9c
     st = r"(?:\u0007|\u001B\u005C|\u009C)"
-    pattern = [
-        rf"[\u001B\u009B][\[\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*|[a-zA-Z\d]+(?:;[-a-zA-Z\d/#&.:=?%@~_]*)*)?{st})",
-        r"(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))",
-    ]
-    ansi_escape = re.compile("|".join(pattern), re.UNICODE)
+    # String controls (OSC, DCS, SOS, PM, APC): ESC ]/P/X/^/_ ... ST
+    # (non-greedy until the first ST)
+    strings = rf"(?:\u001B[\]PX^_][\s\S]*?{st})"
+    # CSI and related: ESC/C1, optional intermediates, optional params
+    # (supports ; and :) then final byte
+    csi = (
+        r"[\u001B\u009B][\[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]"
+    )
+    # re.ASCII keeps \d to 0-9 like JS; [\s\S] still matches any char
+    ansi_escape = re.compile(f"{strings}|{csi}", re.ASCII)
     return ansi_escape.sub("", text)
 
 
-def get_caller_frame(depth: int) -> Optional[FrameType]:
+# Root directory of the e2b package, used as the boundary between SDK frames
+# and user frames when capturing stack traces.
+_SDK_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _is_user_file(filename: str) -> bool:
+    """Check whether a frame's file lies outside the SDK package."""
+    try:
+        return (
+            os.path.commonpath([_SDK_ROOT_DIR, os.path.abspath(filename)])
+            != _SDK_ROOT_DIR
+        )
+    except ValueError:
+        # Different drives on Windows — outside the SDK
+        return True
+
+
+def get_caller_frame() -> Optional[FrameType]:
     """
-    Get the caller's stack frame at a specific depth.
+    Get the caller's stack frame in user code.
 
     This is used to provide better error messages and debugging information
     by tracking where template methods were called from in user code.
 
-    :param depth: The depth of the stack trace to retrieve
+    The caller is the first frame whose file lies outside the SDK package.
+    Selecting frames by boundary rather than by fixed depth keeps the result
+    stable no matter how many SDK-internal frames sit in between.
 
     :return: The caller frame, or None if not available
     """
-    stack = inspect.stack()[1:]
-    if len(stack) < depth + 1:
-        return None
-    return stack[depth].frame
+    frame = inspect.currentframe()
+    while frame is not None:
+        if _is_user_file(frame.f_code.co_filename):
+            return frame
+        frame = frame.f_back
+    return None
 
 
-def get_caller_directory(depth: int) -> Optional[str]:
+def get_caller_directory() -> Optional[str]:
     """
-    Get the directory of the caller at a specific stack depth.
+    Get the directory of the caller in user code.
 
     This is used to determine the file_context_path when creating a template,
     so file paths are resolved relative to the user's template file location.
 
-    :param depth: The depth of the stack trace
-
     :return: The caller's directory path, or None if not available
     """
     try:
-        # Get the stack trace
-        caller_frame = get_caller_frame(depth)
+        caller_frame = get_caller_frame()
         if caller_frame is None:
             return None
 

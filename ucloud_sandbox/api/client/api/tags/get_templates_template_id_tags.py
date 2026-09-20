@@ -45,6 +45,10 @@ def _parse_response(
         response_404 = Error.from_dict(response.json())
 
         return response_404
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -71,7 +75,9 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Union[Error, list["TemplateTag"]]]:
-    """List all tags for a template
+    """List template tags
+
+     List all tags for a template
 
     Args:
         template_id (str):
@@ -100,7 +106,9 @@ def sync(
     *,
     client: AuthenticatedClient,
 ) -> Optional[Union[Error, list["TemplateTag"]]]:
-    """List all tags for a template
+    """List template tags
+
+     List all tags for a template
 
     Args:
         template_id (str):
@@ -124,7 +132,9 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Union[Error, list["TemplateTag"]]]:
-    """List all tags for a template
+    """List template tags
+
+     List all tags for a template
 
     Args:
         template_id (str):
@@ -151,7 +161,9 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
 ) -> Optional[Union[Error, list["TemplateTag"]]]:
-    """List all tags for a template
+    """List template tags
+
+     List all tags for a template
 
     Args:
         template_id (str):

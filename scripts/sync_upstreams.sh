@@ -3,14 +3,10 @@ set -euo pipefail
 
 UPSTREAM_DIR="upstream"
 E2B_SUBMODULE_PATH="$UPSTREAM_DIR/e2b"
-CODE_INTERPRETER_SUBMODULE_PATH="$UPSTREAM_DIR/code-interpreter"
-DESKTOP_SUBMODULE_PATH="$UPSTREAM_DIR/desktop"
 E2B_PACKAGE_PATH="$E2B_SUBMODULE_PATH/packages/python-sdk/e2b"
-E2B_CONNECT_PACKAGE_PATH="$E2B_SUBMODULE_PATH/packages/python-sdk/e2b_connect"
-CODE_INTERPRETER_PACKAGE_PATH="$CODE_INTERPRETER_SUBMODULE_PATH/python/e2b_code_interpreter"
-DESKTOP_PACKAGE_PATH="$DESKTOP_SUBMODULE_PATH/packages/python-sdk/e2b_desktop"
+CODE_INTERPRETER_PACKAGE_PATH="$E2B_SUBMODULE_PATH/packages/code-interpreter-python/e2b_code_interpreter"
+DESKTOP_PACKAGE_PATH="$E2B_SUBMODULE_PATH/packages/desktop-python/e2b_desktop"
 TARGET_PACKAGE_PATH="ucloud_sandbox"
-E2B_CONNECT_TARGET_PACKAGE_PATH="e2b_connect"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
@@ -19,33 +15,24 @@ TARGET_DIR="$REPO_ROOT/$TARGET_PACKAGE_PATH"
 
 ensure_upstream_sources() {
   local needs_update=0
-  local submodule_path
+  local source_path
 
-  for submodule_path in \
-    "$E2B_SUBMODULE_PATH" \
-    "$CODE_INTERPRETER_SUBMODULE_PATH" \
-    "$DESKTOP_SUBMODULE_PATH"; do
-    if [ ! -e "$REPO_ROOT/$submodule_path/.git" ]; then
-      needs_update=1
-    fi
-  done
+  if [ ! -e "$REPO_ROOT/$E2B_SUBMODULE_PATH/.git" ]; then
+    needs_update=1
+  fi
 
-  for submodule_path in \
+  for source_path in \
     "$E2B_PACKAGE_PATH" \
-    "$E2B_CONNECT_PACKAGE_PATH" \
     "$CODE_INTERPRETER_PACKAGE_PATH" \
     "$DESKTOP_PACKAGE_PATH"; do
-    if [ ! -d "$REPO_ROOT/$submodule_path" ]; then
+    if [ ! -d "$REPO_ROOT/$source_path" ]; then
       needs_update=1
     fi
   done
 
   if [ "$needs_update" -eq 1 ]; then
     echo "Initializing/updating upstream submodules"
-    git submodule update --init --recursive \
-      "$E2B_SUBMODULE_PATH" \
-      "$CODE_INTERPRETER_SUBMODULE_PATH" \
-      "$DESKTOP_SUBMODULE_PATH"
+    git submodule update --init --recursive "$E2B_SUBMODULE_PATH"
   fi
 }
 
@@ -78,7 +65,6 @@ replace_dir() {
 
 ensure_upstream_sources
 assert_source_dir "$E2B_PACKAGE_PATH"
-assert_source_dir "$E2B_CONNECT_PACKAGE_PATH"
 assert_source_dir "$CODE_INTERPRETER_PACKAGE_PATH"
 assert_source_dir "$DESKTOP_PACKAGE_PATH"
 
@@ -88,7 +74,6 @@ if [ -L "$TARGET_DIR" ]; then
 fi
 
 replace_dir "$E2B_PACKAGE_PATH" "$TARGET_PACKAGE_PATH"
-replace_dir "$E2B_CONNECT_PACKAGE_PATH" "$E2B_CONNECT_TARGET_PACKAGE_PATH"
 replace_dir "$CODE_INTERPRETER_PACKAGE_PATH" "$TARGET_PACKAGE_PATH/code_interpreter"
 replace_dir "$DESKTOP_PACKAGE_PATH" "$TARGET_PACKAGE_PATH/desktop"
 

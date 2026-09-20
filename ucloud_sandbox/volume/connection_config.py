@@ -1,15 +1,31 @@
+import logging
 import os
 
 from typing import Dict, Optional, TypedDict
 
-from httpx._types import ProxyTypes
 from typing_extensions import Unpack
 
 from ucloud_sandbox.api.metadata import package_version
 from ucloud_sandbox.domain_config import get_ucloud_sandbox_domain
+from ucloud_sandbox.connection_config import ProxyTypes
 
 REQUEST_TIMEOUT: float = 60.0  # 60 seconds
+
+# Timeout for volume file transfers, which stream large bodies and so must not
+# inherit the short REQUEST_TIMEOUT. (Sandbox filesystem streaming instead
+# bounds each chunk by the request timeout and leaves the total to the server.)
 FILE_TIMEOUT: float = 3600.0  # 1 hour
+
+# Idle bound for every read on the volume content transports: the transfer is
+# aborted when no bytes at all arrive for this long. It resets on each chunk,
+# so it never limits total transfer time — only a fully stalled connection.
+# Matches the JS SDK's default stream idle timeout (REQUEST_TIMEOUT_MS).
+#
+# Kept equal to `e2b.connection_config.READ_TIMEOUT` on purpose: the read bound
+# is part of the transport cache key, so the volume streaming pool shares the
+# sandbox-filesystem streaming pool only while the two constants agree. Change
+# one and they silently split into two reqwest pools.
+READ_TIMEOUT: float = 60.0  # 60 seconds
 
 
 class VolumeApiParams(TypedDict, total=False):
@@ -40,6 +56,9 @@ class VolumeApiParams(TypedDict, total=False):
 
     proxy: Optional[ProxyTypes]
     """Proxy to use for the request."""
+
+    logger: Optional[logging.Logger]
+    """Logger used for request and response logging. Accepts a standard library `logging.Logger`."""
 
 
 class VolumeConnectionConfig:
@@ -87,13 +106,19 @@ class VolumeConnectionConfig:
         request_timeout: Optional[float] = None,
         headers: Optional[Dict[str, str]] = None,
         proxy: Optional[ProxyTypes] = None,
+        logger: Optional[logging.Logger] = None,
     ):
+        self.logger = logger
         self.domain = domain or self._domain()
         self.debug = debug if debug is not None else self._debug()
         self.insecure_http = (
             True
             if self.debug
-            else (insecure_http if insecure_http is not None else self._insecure_http())
+            else (
+                insecure_http
+                if insecure_http is not None
+                else self._insecure_http()
+            )
         )
         protocol = "http" if self.insecure_http else "https"
 
@@ -135,6 +160,7 @@ class VolumeConnectionConfig:
         token = opts.get("token")
         api_url = opts.get("api_url")
         proxy = opts.get("proxy")
+        logger = opts.get("logger")
 
         req_headers = self.headers.copy()
         if headers is not None:
@@ -145,12 +171,15 @@ class VolumeConnectionConfig:
                 domain=domain if domain is not None else self.domain,
                 debug=debug if debug is not None else self.debug,
                 insecure_http=(
-                    insecure_http if insecure_http is not None else self.insecure_http
+                    insecure_http
+                    if insecure_http is not None
+                    else self.insecure_http
                 ),
                 token=token if token is not None else self.token,
                 api_url=api_url if api_url is not None else self.api_url,
                 request_timeout=self.get_request_timeout(request_timeout),
                 headers=req_headers,
                 proxy=proxy if proxy is not None else self.proxy,
+                logger=logger if logger is not None else self.logger,
             )
         )

@@ -47,6 +47,10 @@ def _parse_response(
         response_404 = Error.from_dict(response.json())
 
         return response_404
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -73,7 +77,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: DeleteTemplateTagsRequest,
 ) -> Response[Union[Any, Error]]:
-    """Delete multiple tags from templates
+    """Delete template tags
+
+     Delete multiple tags from templates
 
     Args:
         body (DeleteTemplateTagsRequest):
@@ -102,7 +108,9 @@ def sync(
     client: AuthenticatedClient,
     body: DeleteTemplateTagsRequest,
 ) -> Optional[Union[Any, Error]]:
-    """Delete multiple tags from templates
+    """Delete template tags
+
+     Delete multiple tags from templates
 
     Args:
         body (DeleteTemplateTagsRequest):
@@ -126,7 +134,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: DeleteTemplateTagsRequest,
 ) -> Response[Union[Any, Error]]:
-    """Delete multiple tags from templates
+    """Delete template tags
+
+     Delete multiple tags from templates
 
     Args:
         body (DeleteTemplateTagsRequest):
@@ -153,7 +163,9 @@ async def asyncio(
     client: AuthenticatedClient,
     body: DeleteTemplateTagsRequest,
 ) -> Optional[Union[Any, Error]]:
-    """Delete multiple tags from templates
+    """Delete template tags
+
+     Delete multiple tags from templates
 
     Args:
         body (DeleteTemplateTagsRequest):

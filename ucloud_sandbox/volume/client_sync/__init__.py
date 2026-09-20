@@ -1,29 +1,33 @@
-import logging
-import os
-import threading
-from typing import Dict, Optional
-
 import httpx
-from httpx import Limits
-from httpx._types import ProxyTypes
+from pyqwest.httpx import PyqwestTransport
 
+from ucloud_sandbox.api import (
+    make_logging_event_hooks,
+    proxy_to_config,
+)
+from ucloud_sandbox.api.client_sync import get_httpx_transport
 from ucloud_sandbox.api.metadata import default_headers
 from ucloud_sandbox.exceptions import AuthenticationException
 from ucloud_sandbox.volume.client.client import AuthenticatedClient as VolumeApiClient
-from ucloud_sandbox.volume.connection_config import VolumeConnectionConfig
-
-logger = logging.getLogger(__name__)
-
-limits = Limits(
-    max_keepalive_connections=int(os.getenv("UCLOUD_SANDBOX_MAX_KEEPALIVE_CONNECTIONS", "20")),
-    max_connections=int(os.getenv("UCLOUD_SANDBOX_MAX_CONNECTIONS", "2000")),
-    keepalive_expiry=int(os.getenv("UCLOUD_SANDBOX_KEEPALIVE_EXPIRY", "300")),
-)
-
-TransportKey = Optional[ProxyTypes]
+from ucloud_sandbox.volume.connection_config import READ_TIMEOUT, VolumeConnectionConfig
 
 
 def get_api_client(config: VolumeConnectionConfig, **kwargs) -> VolumeApiClient:
+    """The client for volume content API calls."""
+    return _api_client(config, get_transport(config), **kwargs)
+
+
+def get_streaming_api_client(
+    config: VolumeConnectionConfig, **kwargs
+) -> VolumeApiClient:
+    """The client for streamed downloads: the same client on the streaming
+    transport, which bounds a stalled read (see :func:`get_streaming_transport`)."""
+    return _api_client(config, get_streaming_transport(config), **kwargs)
+
+
+def _api_client(
+    config: VolumeConnectionConfig, transport: PyqwestTransport, **kwargs
+) -> VolumeApiClient:
     if config.access_token is None:
         raise AuthenticationException(
             "Volume token is required for volume content operations. "
@@ -47,39 +51,38 @@ def get_api_client(config: VolumeConnectionConfig, **kwargs) -> VolumeApiClient:
         timeout=(
             httpx.Timeout(request_timeout) if request_timeout is not None else None
         ),
-        httpx_args={"proxy": config.proxy, "transport": get_transport(config)},
+        httpx_args={
+            # The proxy lives in the cached transport; passing `proxy` here too
+            # would mount a fresh, never-closed proxy transport per client.
+            "transport": transport,
+            "event_hooks": make_logging_event_hooks(config.logger),
+        },
         **kwargs,
     )
 
 
-class TransportWithLogger(httpx.HTTPTransport):
-    _thread_local = threading.local()
+def get_transport(config: VolumeConnectionConfig) -> PyqwestTransport:
+    """The shared pyqwest-backed httpx transport for volume content API calls —
+    the same pool the control-plane REST API and the envd HTTP API draw from
+    (see :func:`e2b.api.client_sync.get_pyqwest_transport`); reqwest pools per
+    host, so the volume host gets its own connections within it.
 
-    def handle_request(self, request):
-        url = f"{request.url.scheme}://{request.url.host}{request.url.path}"
-        logger.info(f"Request: {request.method} {url}")
-        response = super().handle_request(request)
-        logger.info(f"Response: {response.status_code} {url}")
-        return response
-
-    @property
-    def pool(self):
-        return self._pool
+    It carries no idle read bound: reqwest's read timer keeps running while a
+    request body is sent and while waiting for the response head, so one here
+    would cut off uploads and slow unary responses (they stay bounded by
+    their whole-request deadlines instead). Streamed downloads, which do need
+    an idle bound, use :func:`get_streaming_transport`.
+    """
+    return get_httpx_transport(proxy_to_config(config.proxy))
 
 
-def get_transport(config: VolumeConnectionConfig) -> TransportWithLogger:
-    instances: Dict[TransportKey, TransportWithLogger] = getattr(
-        TransportWithLogger._thread_local, "instances", {}
-    )
-    key: TransportKey = config.proxy
-    cached = instances.get(key)
-    if cached is not None:
-        return cached
-
-    transport = TransportWithLogger(
-        limits=limits,
-        proxy=config.proxy,
-    )
-    instances[key] = transport
-    TransportWithLogger._thread_local.instances = instances
-    return transport
+def get_streaming_transport(config: VolumeConnectionConfig) -> PyqwestTransport:
+    """The transport for streamed downloads, carrying ``READ_TIMEOUT`` as the
+    idle bound on every read: it resets after each successful read, so it caps
+    how long a streamed download may stall without limiting total transfer
+    time. It is fixed per pool — the adapter's per-request timeouts are
+    whole-request deadlines rather than idle bounds — so streamed downloads get
+    their own, shared with the sandbox filesystem's streaming transport
+    whenever the two bounds agree.
+    """
+    return get_httpx_transport(proxy_to_config(config.proxy), READ_TIMEOUT)

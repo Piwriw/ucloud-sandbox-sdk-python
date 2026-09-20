@@ -3,7 +3,12 @@ from typing import Optional, TypedDict
 
 from packaging.version import Version
 
-from ucloud_sandbox.connection_config import ConnectionConfig, default_username
+
+from ucloud_sandbox.connection_config import (
+    ClientFactory,
+    ConnectionConfig,
+    default_username,
+)
 from ucloud_sandbox.envd.api import ENVD_API_FILES_ROUTE
 from ucloud_sandbox.envd.versions import ENVD_DEFAULT_USER
 from ucloud_sandbox.exceptions import InvalidArgumentException
@@ -19,7 +24,7 @@ class SandboxOpts(TypedDict):
     connection_config: ConnectionConfig
 
 
-class SandboxBase:
+class SandboxBase(ClientFactory):
     mcp_port = 50005
 
     default_sandbox_timeout = 300
@@ -227,9 +232,7 @@ class SandboxBase:
 
         :return: URL for connecting to the sandbox port
         """
-        return (
-            f"{self.connection_config.sandbox_protocol}://{self.get_host(port)}{path}"
-        )
+        return f"{self.connection_config.sandbox_protocol}://{self.get_host(port)}{path}"
 
     def get_mcp_url(self) -> str:
         """

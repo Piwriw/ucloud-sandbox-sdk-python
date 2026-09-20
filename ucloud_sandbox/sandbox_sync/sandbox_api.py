@@ -1,16 +1,23 @@
 import datetime
-from typing import Any, Dict, List, Optional, cast
+import logging
+from typing import Any, Dict, List, Optional, Union, cast
 
 from packaging.version import Version
 from typing_extensions import Unpack
 
-from ucloud_sandbox.api import SandboxCreateResponse, handle_api_exception
+from ucloud_sandbox.api import (
+    SandboxCreateResponse,
+    api_exception_from_code,
+    encode_path_param,
+    handle_api_exception,
+)
 from ucloud_sandbox.api.client.api.sandboxes import (
     delete_sandboxes_sandbox_id,
     get_sandboxes_sandbox_id,
     get_sandboxes_sandbox_id_metrics,
     post_sandboxes,
     post_sandboxes_sandbox_id_connect,
+    post_sandboxes_sandbox_id_fork,
     post_sandboxes_sandbox_id_pause,
     post_sandboxes_sandbox_id_snapshots,
     post_sandboxes_sandbox_id_timeout,
@@ -21,16 +28,18 @@ from ucloud_sandbox.api.client.models import (
     ConnectSandbox,
     Error,
     NewSandbox,
-    PostSandboxesSandboxIDSnapshotsBody,
-    PostSandboxesSandboxIDTimeoutBody,
-    SandboxAutoResumeConfig,
+    SandboxSnapshotRequest,
+    SandboxTimeoutRequest,
+    SandboxForkRequest,
     SandboxNetworkConfig,
+    SandboxPauseRequest,
     SandboxVolumeMount as SandboxVolumeMountAPI,
 )
-from ucloud_sandbox.api.client.types import UNSET
+from ucloud_sandbox.api.client.types import UNSET, Unset
 from ucloud_sandbox.connection_config import ApiParams, ConnectionConfig
 from ucloud_sandbox.exceptions import (
     InvalidArgumentException,
+    NotFoundException,
     SandboxException,
     SandboxNotFoundException,
     TemplateException,
@@ -39,40 +48,53 @@ from ucloud_sandbox.sandbox.main import SandboxBase
 from ucloud_sandbox.sandbox.sandbox_api import (
     build_network_update_body,
     McpServer,
+    SandboxIamOpts,
     SandboxInfo,
     SandboxLifecycle,
+    SandboxListOrder,
     SandboxMetrics,
     SandboxNetworkOpts,
     SandboxNetworkUpdate,
+    SandboxOnResume,
+    resolve_connect_memory,
     SandboxQuery,
     SnapshotInfo,
+    build_iam_config,
+    build_lifecycle_config,
     build_network_config,
 )
 from ucloud_sandbox.sandbox_sync.paginator import SandboxPaginator, get_api_client
 
 
 class SandboxApi(SandboxBase):
-    @staticmethod
+    @classmethod
     def list(
+        cls,
         query: Optional[SandboxQuery] = None,
         limit: Optional[int] = None,
         next_token: Optional[str] = None,
+        order: Optional[SandboxListOrder] = None,
         **opts: Unpack[ApiParams],
     ) -> SandboxPaginator:
         """
-        List all running sandboxes.
+        List sandboxes.
 
-        :param query: Filter the list of sandboxes by metadata or state, e.g. `SandboxListQuery(metadata={"key": "value"})` or `SandboxListQuery(state=[SandboxState.RUNNING])`
+        By default (no `query.state` set), returns sandboxes in both `running`
+        and `paused` states. To filter by state, pass `query=SandboxQuery(state=[...])`.
+
+        :param query: Filter the list of sandboxes by metadata, state, start time, or template, e.g. `SandboxQuery(metadata={"key": "value"})` or `SandboxQuery(state=[SandboxState.RUNNING])`
         :param limit: Maximum number of sandboxes to return per page
         :param next_token: Token for pagination
+        :param order: Sort order of the list of sandboxes by start time, applied across the whole result set before pagination (not within a page), defaults to `"desc"` (newest first)
 
-        :return: List of running sandboxes
+        :return: A `SandboxPaginator` that yields pages of sandboxes (running and paused by default). Iterate pages via `paginator.next_items()` while `paginator.has_next` is True.
         """
         return SandboxPaginator(
             query=query,
             limit=limit,
             next_token=next_token,
-            **opts,
+            order=order,
+            **cls._resolve_api_params(**opts),
         )
 
     @classmethod
@@ -87,7 +109,7 @@ class SandboxApi(SandboxBase):
 
         :return: Sandbox info
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         api_client = get_api_client(config)
         res = get_sandboxes_sandbox_id.sync_detailed(
@@ -115,7 +137,7 @@ class SandboxApi(SandboxBase):
         sandbox_id: str,
         **opts: Unpack[ApiParams],
     ) -> bool:
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         if config.debug:
             # Skip killing the sandbox in debug mode
@@ -142,7 +164,7 @@ class SandboxApi(SandboxBase):
         timeout: int,
         **opts: Unpack[ApiParams],
     ) -> None:
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         if config.debug:
             # Skip setting timeout in debug mode
@@ -152,7 +174,7 @@ class SandboxApi(SandboxBase):
         res = post_sandboxes_sandbox_id_timeout.sync_detailed(
             sandbox_id,
             client=api_client,
-            body=PostSandboxesSandboxIDTimeoutBody(timeout=timeout),
+            body=SandboxTimeoutRequest(timeout=timeout),
         )
 
         if res.status_code == 404:
@@ -168,7 +190,7 @@ class SandboxApi(SandboxBase):
         network: SandboxNetworkUpdate,
         **opts: Unpack[ApiParams],
     ) -> None:
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         api_client = get_api_client(config)
         res = put_sandboxes_sandbox_id_network.sync_detailed(
@@ -194,25 +216,26 @@ class SandboxApi(SandboxBase):
         secure: bool,
         mcp: Optional[McpServer] = None,
         network: Optional[SandboxNetworkOpts] = None,
+        iam: Optional[SandboxIamOpts] = None,
         lifecycle: Optional[SandboxLifecycle] = None,
         volume_mounts: Optional[List[SandboxVolumeMountAPI]] = None,
+        logger: Optional[logging.Logger] = None,
         **opts: Unpack[ApiParams],
     ) -> SandboxCreateResponse:
-        config = ConnectionConfig(**opts)
+        params = cls._resolve_api_params(**opts)
+        config = ConnectionConfig(logger=logger, **params)
 
-        on_timeout = lifecycle.get("on_timeout", "kill") if lifecycle else "kill"
-        auto_resume = lifecycle.get("auto_resume", False) if lifecycle else False
+        lifecycle_body = build_lifecycle_config(lifecycle)
 
-        if auto_resume and on_timeout != "pause":
-            raise InvalidArgumentException(
-                "auto_resume can only be True when the resolved on_timeout is 'pause'."
-            )
-
-        network_body = build_network_config(network)
+        # Built before the network config: ``transform`` callables are resolved
+        # against the workload tokens this request registers.
+        iam_body = build_iam_config(iam)
+        network_body = build_network_config(network, iam_body)
         body = NewSandbox(
             template_id=template,
-            auto_pause=on_timeout == "pause",
-            auto_resume=SandboxAutoResumeConfig(enabled=auto_resume),
+            auto_pause=lifecycle_body.auto_pause,
+            auto_pause_memory=lifecycle_body.auto_pause_memory,
+            auto_resume=lifecycle_body.auto_resume,
             metadata=metadata or {},
             timeout=timeout,
             env_vars=env_vars or {},
@@ -220,6 +243,7 @@ class SandboxApi(SandboxBase):
             secure=secure,
             allow_internet_access=allow_internet_access,
             network=SandboxNetworkConfig(**network_body) if network_body else UNSET,
+            iam=iam_body or UNSET,
             volume_mounts=volume_mounts if volume_mounts else UNSET,
         )
 
@@ -239,7 +263,7 @@ class SandboxApi(SandboxBase):
             raise SandboxException(f"{res.parsed.message}: Request failed")
 
         if Version(res.parsed.envd_version) < Version("0.1.0"):
-            SandboxApi._cls_kill(res.parsed.sandbox_id)
+            SandboxApi._cls_kill(res.parsed.sandbox_id, **params)
             raise TemplateException(
                 "You need to update the template to use the new SDK."
             )
@@ -272,7 +296,7 @@ class SandboxApi(SandboxBase):
         end: Optional[datetime.datetime] = None,
         **opts: Unpack[ApiParams],
     ) -> List[SandboxMetrics]:
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         if config.debug:
             # Skip getting the metrics in debug mode
@@ -318,17 +342,23 @@ class SandboxApi(SandboxBase):
         cls,
         sandbox_id: str,
         timeout: Optional[int] = None,
+        logger: Optional[logging.Logger] = None,
+        *,
+        on_resume: SandboxOnResume = "restore",
         **opts: Unpack[ApiParams],
     ) -> SandboxCreateResponse:
         timeout = timeout or SandboxBase.default_sandbox_timeout
 
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(logger=logger, **cls._resolve_api_params(**opts))
 
         api_client = get_api_client(config)
         res = post_sandboxes_sandbox_id_connect.sync_detailed(
             sandbox_id,
             client=api_client,
-            body=ConnectSandbox(timeout=timeout),
+            body=ConnectSandbox(
+                timeout=timeout,
+                memory=resolve_connect_memory(on_resume),
+            ),
         )
 
         if res.status_code == 404:
@@ -364,19 +394,106 @@ class SandboxApi(SandboxBase):
         )
 
     @classmethod
+    def _cls_fork(
+        cls,
+        sandbox_id: str,
+        timeout: Optional[int] = None,
+        count: Optional[int] = None,
+        logger: Optional[logging.Logger] = None,
+        **opts: Unpack[ApiParams],
+    ) -> List[Union[SandboxCreateResponse, Exception]]:
+        timeout = (
+            timeout if timeout is not None else SandboxBase.default_sandbox_timeout
+        )
+        count = count if count is not None else 1
+
+        if count < 1:
+            raise InvalidArgumentException("count must be at least 1")
+
+        config = ConnectionConfig(logger=logger, **cls._resolve_api_params(**opts))
+
+        api_client = get_api_client(config)
+        res = post_sandboxes_sandbox_id_fork.sync_detailed(
+            sandbox_id,
+            client=api_client,
+            body=SandboxForkRequest(timeout=timeout, count=count),
+        )
+
+        if res.status_code == 404:
+            message = (
+                res.parsed.message
+                if isinstance(res.parsed, Error)
+                else f"Sandbox {sandbox_id} not found"
+            )
+            raise SandboxNotFoundException(message)
+
+        if res.status_code >= 300:
+            raise handle_api_exception(res)
+
+        if isinstance(res.parsed, Error):
+            raise SandboxException(f"{res.parsed.message}: Request failed")
+
+        if res.parsed is None:
+            raise Exception("Body of the request is None")
+
+        results: List[Union[SandboxCreateResponse, Exception]] = []
+        for result in res.parsed:
+            sandbox = None if isinstance(result.sandbox, Unset) else result.sandbox
+            error = None if isinstance(result.error, Unset) else result.error
+
+            if error is not None or sandbox is None:
+                if error is None:
+                    exception = SandboxException("Failed to start forked sandbox")
+                elif error.code == 404:
+                    # 404 is call-site-specific in the SDK, so
+                    # api_exception_from_code leaves it to the caller. A
+                    # per-fork 404 refers to a resource needed to start that
+                    # fork (e.g. the snapshot) — not the source sandbox, which
+                    # would have failed the whole request — so stay generic.
+                    exception = NotFoundException(f"{error.code}: {error.message}")
+                else:
+                    exception = api_exception_from_code(error.code, error.message)
+                results.append(exception)
+                continue
+
+            domain = sandbox.domain if isinstance(sandbox.domain, str) else None
+            envd_token = (
+                sandbox.envd_access_token
+                if isinstance(sandbox.envd_access_token, str)
+                else None
+            )
+            traffic_token = (
+                sandbox.traffic_access_token
+                if isinstance(sandbox.traffic_access_token, str)
+                else None
+            )
+
+            results.append(
+                SandboxCreateResponse(
+                    sandbox_id=sandbox.sandbox_id,
+                    sandbox_domain=domain,
+                    envd_version=sandbox.envd_version,
+                    envd_access_token=envd_token,
+                    traffic_access_token=traffic_token,
+                )
+            )
+
+        return results
+
+    @classmethod
     def _cls_create_snapshot(
         cls,
         sandbox_id: str,
         name: Optional[str] = None,
         **opts: Unpack[ApiParams],
     ) -> SnapshotInfo:
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         api_client = get_api_client(config)
         res = post_sandboxes_sandbox_id_snapshots.sync_detailed(
             sandbox_id,
             client=api_client,
-            body=PostSandboxesSandboxIDSnapshotsBody(name=name if name else UNSET),
+            body=SandboxSnapshotRequest(name=name if name else UNSET),
         )
 
         if res.status_code == 404:
@@ -402,11 +519,11 @@ class SandboxApi(SandboxBase):
         snapshot_id: str,
         **opts: Unpack[ApiParams],
     ) -> bool:
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         api_client = get_api_client(config)
         res = delete_templates_template_id.sync_detailed(
-            snapshot_id,
+            encode_path_param(snapshot_id),
             client=api_client,
         )
 
@@ -422,14 +539,16 @@ class SandboxApi(SandboxBase):
     def _cls_pause(
         cls,
         sandbox_id: str,
+        keep_memory: bool = True,
         **opts: Unpack[ApiParams],
     ) -> bool:
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         api_client = get_api_client(config)
         res = post_sandboxes_sandbox_id_pause.sync_detailed(
             sandbox_id,
             client=api_client,
+            body=SandboxPauseRequest(memory=keep_memory),
         )
 
         if res.status_code == 404:

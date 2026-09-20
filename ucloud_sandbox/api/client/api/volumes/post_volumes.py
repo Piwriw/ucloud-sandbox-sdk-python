@@ -45,6 +45,10 @@ def _parse_response(
         response_401 = Error.from_dict(response.json())
 
         return response_401
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -71,7 +75,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: NewVolume,
 ) -> Response[Union[Error, VolumeAndToken]]:
-    """Create a new team volume
+    """Create team volume
+
+     Create a new team volume
 
     Args:
         body (NewVolume):
@@ -100,7 +106,9 @@ def sync(
     client: AuthenticatedClient,
     body: NewVolume,
 ) -> Optional[Union[Error, VolumeAndToken]]:
-    """Create a new team volume
+    """Create team volume
+
+     Create a new team volume
 
     Args:
         body (NewVolume):
@@ -124,7 +132,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: NewVolume,
 ) -> Response[Union[Error, VolumeAndToken]]:
-    """Create a new team volume
+    """Create team volume
+
+     Create a new team volume
 
     Args:
         body (NewVolume):
@@ -151,7 +161,9 @@ async def asyncio(
     client: AuthenticatedClient,
     body: NewVolume,
 ) -> Optional[Union[Error, VolumeAndToken]]:
-    """Create a new team volume
+    """Create team volume
+
+     Create a new team volume
 
     Args:
         body (NewVolume):

@@ -1,36 +1,173 @@
-import asyncio
 import json
 import logging
 import os
-import re
-import threading
-import weakref
+import zlib
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Callable, Optional, Protocol, Union
+from typing import NamedTuple, Optional, Protocol, Tuple, Union
+from urllib.parse import quote
 
 import httpx
-from httpx import AsyncBaseTransport, BaseTransport, Limits, Timeout
+from httpx import AsyncBaseTransport, BaseTransport, Timeout
+from pyqwest import Proxy
 
 from ucloud_sandbox.api.client.client import AuthenticatedClient
 from ucloud_sandbox.api.client.types import Response
 from ucloud_sandbox.api.metadata import default_headers
-from ucloud_sandbox.connection_config import ConnectionConfig
+from ucloud_sandbox.connection_config import ConnectionConfig, ProxyTypes
 from ucloud_sandbox.exceptions import (
     AuthenticationException,
+    InvalidArgumentException,
     RateLimitException,
+    ServiceBusyException,
     SandboxException,
 )
 
-logger = logging.getLogger(__name__)
 
-limits = Limits(
-    max_keepalive_connections=int(os.getenv("UCLOUD_SANDBOX_MAX_KEEPALIVE_CONNECTIONS", "20")),
-    max_connections=int(os.getenv("UCLOUD_SANDBOX_MAX_CONNECTIONS", "2000")),
-    keepalive_expiry=int(os.getenv("UCLOUD_SANDBOX_KEEPALIVE_EXPIRY", "300")),
-)
+def encode_path_param(value: str) -> str:
+    """
+    Percent-encode a template ID, name, or alias for use as one URL path segment.
 
-connection_retries = int(os.getenv("UCLOUD_SANDBOX_CONNECTION_RETRIES", "3"))
+    Endpoints that take a template ID also accept a name, which may be
+    namespaced (``namespace/name``) and carry a ``:tag``. Escaping those
+    separators keeps the value inside a single segment instead of splitting the
+    route, matching the JS SDK's ``encodeURIComponent``.
+    """
+    return quote(value, safe="")
+
+
+def make_logging_event_hooks(
+    log: Optional[logging.Logger], include_diagnostics: bool = False
+) -> dict:
+    """Build synchronous httpx ``event_hooks`` that log requests and responses
+    to the given ``logging.Logger``. Requests log at ``INFO``, successful
+    responses at ``INFO`` and responses with status >= 400 at ``ERROR``.
+
+    Returns no hooks when ``log`` is ``None`` unless CI diagnostics are enabled;
+    that mode logs failed responses only."""
+    if log is None and not include_diagnostics:
+        return {}
+
+    response_log = log or logging.getLogger("e2b.ci")
+
+    def on_request(request) -> None:
+        if log is not None:
+            log.info(f"Request {request.method} {request.url}")
+
+    def on_response(response: Response) -> None:
+        if response.status_code >= 400:
+            trace_id = (
+                response.headers.get("X-E2B-Trace-ID") if include_diagnostics else None
+            )
+            trace_suffix = f" trace_id={trace_id}" if trace_id else ""
+            response_log.error(f"Response {response.status_code}{trace_suffix}")
+        elif log is not None:
+            log.info(f"Response {response.status_code}")
+
+    return {"request": [on_request], "response": [on_response]}
+
+
+def make_async_logging_event_hooks(
+    log: Optional[logging.Logger], include_diagnostics: bool = False
+) -> dict:
+    """Asynchronous counterpart of :func:`make_logging_event_hooks`."""
+    if log is None and not include_diagnostics:
+        return {}
+
+    response_log = log or logging.getLogger("e2b.ci")
+
+    async def on_request(request) -> None:
+        if log is not None:
+            log.info(f"Request {request.method} {request.url}")
+
+    async def on_response(response: Response) -> None:
+        if response.status_code >= 400:
+            trace_id = (
+                response.headers.get("X-E2B-Trace-ID") if include_diagnostics else None
+            )
+            trace_suffix = f" trace_id={trace_id}" if trace_id else ""
+            response_log.error(f"Response {response.status_code}{trace_suffix}")
+        elif log is not None:
+            log.info(f"Response {response.status_code}")
+
+    return {"request": [on_request], "response": [on_response]}
+
+
+connection_retries = int(os.getenv("UCLOUD_SANDBOX_CONNECTION_RETRIES") or "3")
+
+# Pool tuning for the pyqwest transports, shared by the REST API, envd RPC,
+# and envd HTTP API stacks. `pool_max_idle_per_host` is per host rather than
+# the global idle cap the httpx transports took, which suits both: API traffic
+# goes to a single host and each sandbox is its own host. `UCLOUD_SANDBOX_MAX_CONNECTIONS`
+# has no counterpart left — reqwest does not cap concurrent connections — so it
+# is no longer read.
+pool_idle_timeout = float(os.getenv("UCLOUD_SANDBOX_KEEPALIVE_EXPIRY") or "300")
+pool_max_idle_per_host = int(os.getenv("UCLOUD_SANDBOX_MAX_KEEPALIVE_CONNECTIONS") or "20")
+envd_pool_shards = max(1, int(os.getenv("UCLOUD_SANDBOX_ENVD_POOL_SHARDS") or "4"))
+
+
+def envd_pool_shard(config: ConnectionConfig) -> int:
+    """Return the stable connection-pool shard for a sandbox's envd traffic.
+
+    Production envd requests share one origin, whose HTTP/2 connection has a
+    finite concurrent-stream limit. Long-running commands hold those streams,
+    so one process-wide connection becomes a bottleneck even though the edge
+    and account can run more sandboxes. A small bounded set of pools provides
+    additional connections without returning to one connection per sandbox.
+
+    The sandbox ID is carried on every envd request and CRC32 is stable across
+    processes, unlike Python's randomized ``hash``. Configs without a sandbox
+    ID (including control-plane clients) stay on shard zero.
+    """
+    sandbox_id = config.sandbox_headers.get("E2b-Sandbox-Id")
+    if not sandbox_id:
+        return 0
+    return zlib.crc32(sandbox_id.encode()) % envd_pool_shards
+
+
+class ProxyConfig(NamedTuple):
+    """The ``proxy`` connection option in the shape pyqwest transports take.
+
+    A tuple so it can key the transport caches directly: it is hashable and
+    compares by value, where a ``pyqwest.Proxy`` compares by identity and
+    would hand every call its own connection pool."""
+
+    url: str
+    auth: Optional[Tuple[str, str]] = None
+    headers: Tuple[Tuple[str, str], ...] = ()
+
+    def to_pyqwest(self) -> Proxy:
+        """The ``pyqwest.Proxy`` to hand a transport."""
+        return Proxy(self.url, auth=self.auth, headers=self.headers or None)
+
+
+def proxy_to_config(proxy: Optional[ProxyTypes]) -> Optional[ProxyConfig]:
+    """Convert the ``proxy`` connection option — a URL string, an
+    ``httpx.URL``, or an ``httpx.Proxy`` — to the proxy configuration pyqwest
+    transports take: a proxy URL (scheme http, https, socks5, or socks5h,
+    credentials allowed in the userinfo), basic-auth credentials, and headers
+    to send to the proxy. An ``httpx.Proxy`` ``ssl_context`` has no pyqwest
+    counterpart and is rejected rather than silently dropped."""
+    if proxy is None:
+        return None
+    if isinstance(proxy, str):
+        return ProxyConfig(proxy)
+    if isinstance(proxy, httpx.URL):
+        return ProxyConfig(str(proxy))
+    if isinstance(proxy, httpx.Proxy):
+        if proxy.ssl_context is not None:
+            raise InvalidArgumentException("httpx.Proxy ssl_context is not supported")
+        # httpx.Proxy splits userinfo out of the URL into `.auth`; pyqwest
+        # takes the credentials the same way, so they pass straight through.
+        return ProxyConfig(
+            str(proxy.url),
+            auth=proxy.auth,
+            headers=tuple(proxy.headers.items()),
+        )
+    raise InvalidArgumentException(
+        "Only URL-string, httpx.URL, and httpx.Proxy proxies are supported, "
+        'e.g. proxy="http://user:pass@localhost:8030"'
+    )
 
 
 @dataclass
@@ -40,6 +177,42 @@ class SandboxCreateResponse:
     envd_version: str
     envd_access_token: Optional[str]
     traffic_access_token: Optional[str]
+
+
+def api_exception_from_code(
+    status_code: int,
+    message: Optional[str] = None,
+    default_exception_class: type[Exception] = SandboxException,
+    stack_trace: Optional[TracebackType] = None,
+) -> Exception:
+    """Map an API error code and message to the matching exception class — the
+    same mapping :func:`handle_api_exception` applies to HTTP responses, usable
+    for error objects embedded in response bodies (e.g. per-fork results)."""
+    if status_code == 401:
+        text = f"{status_code}: Unauthorized, please check your credentials."
+        if message:
+            text += f" - {message}"
+        return AuthenticationException(text)
+
+    if status_code == 429:
+        text = f"{status_code}: Rate limit exceeded, please try again later."
+        if message:
+            text += f" - {message}"
+        return RateLimitException(text)
+
+    if status_code == 503:
+        text = f"{status_code}: Service temporarily unavailable, please retry."
+        if message:
+            text += f" - {message}"
+        return ServiceBusyException(text)
+
+    err = default_exception_class(f"{status_code}: {message}").with_traceback(
+        stack_trace
+    )
+    if isinstance(err, SandboxException):
+        err.status_code = status_code
+
+    return err
 
 
 def handle_api_exception(
@@ -52,24 +225,21 @@ def handle_api_exception(
     except json.JSONDecodeError:
         body = {}
 
-    if e.status_code == 401:
-        message = f"{e.status_code}: Unauthorized, please check your credentials."
-        if body.get("message"):
-            message += f" - {body['message']}"
-        return AuthenticationException(message)
+    message = body["message"] if "message" in body else None
+    if message is None and e.status_code not in (401, 429, 503):
+        err = default_exception_class(f"{e.status_code}: {e.content}").with_traceback(
+            stack_trace
+        )
+        if isinstance(err, SandboxException):
+            err.status_code = e.status_code
 
-    if e.status_code == 429:
-        message = f"{e.status_code}: Rate limit exceeded, please try again later."
-        if body.get("message"):
-            message += f" - {body['message']}"
-        return RateLimitException(message)
+        return err
 
-    if "message" in body:
-        return default_exception_class(
-            f"{e.status_code}: {body['message']}"
-        ).with_traceback(stack_trace)
-    return default_exception_class(f"{e.status_code}: {e.content}").with_traceback(
-        stack_trace
+    return api_exception_from_code(
+        e.status_code,
+        message,
+        default_exception_class,
+        stack_trace,
     )
 
 
@@ -81,46 +251,23 @@ class SupportsApiErrorResponse(Protocol):
     def content(self) -> Union[str, bytes]: ...
 
 
-_API_KEY_PATTERN = re.compile(r"\A.+\Z")
-
-
-def validate_api_key(api_key: str) -> None:
-    """Validate that a UCloud Sandbox API key is not empty."""
-    if not _API_KEY_PATTERN.match(api_key):
-        raise AuthenticationException(
-            "Invalid API key format. Set `UCLOUD_SANDBOX_API_KEY` "
-            "or pass `api_key` directly. See https://astraflow.ucloud.cn/docs/agent-sandbox/product/01-prerequisites."
-        )
-
-
 class ApiClient(AuthenticatedClient):
     """
     The client for interacting with the UCloud Sandbox API.
+
+    A single lazily-created httpx client (see the generated
+    ``AuthenticatedClient``) serves all threads and event loops: the pyqwest
+    transports it delegates to are thread-safe and loop-independent, and
+    ``httpx.Client`` is documented thread-safe.
     """
 
     def __init__(
         self,
         config: ConnectionConfig,
         transport: Optional[Union[BaseTransport, AsyncBaseTransport]] = None,
-        transport_factory: Optional[Callable[[], BaseTransport]] = None,
-        async_transport_factory: Optional[Callable[[], AsyncBaseTransport]] = None,
         *args,
         **kwargs,
     ):
-        if transport is not None and (
-            transport_factory is not None or async_transport_factory is not None
-        ):
-            raise ValueError("Use either transport or transport_factory, not both")
-
-        self._transport_factory = transport_factory
-        self._async_transport_factory = async_transport_factory
-        self._thread_local = threading.local()
-        # Keyed weakly by the event loop object itself, not id(loop) —
-        # CPython reuses object ids, so a new loop could otherwise inherit
-        # a client bound to a previous, closed loop.
-        self._async_clients: weakref.WeakKeyDictionary[
-            asyncio.AbstractEventLoop, httpx.AsyncClient
-        ] = weakref.WeakKeyDictionary()
         self._proxy = config.proxy
 
         if config.api_key is None:
@@ -130,24 +277,15 @@ class ApiClient(AuthenticatedClient):
                 'or you can pass it directly to the method like api_key="..."',
             )
 
-        if config.api_key is not None and config.validate_api_key:
-            validate_api_key(config.api_key)
-
         token = config.api_key
         auth_header_name = "X-API-KEY"
         prefix = ""
 
+        self._logger = config.logger
+        self._include_diagnostics = config.request_source == "ci"
+
         headers = {
             **default_headers,
-            # Deprecated: send the access token alongside the API key when one
-            # is available, mirroring the JS SDK. Prefer `api_headers` instead.
-            # Spread before `config.headers` so a custom `Authorization` in
-            # `api_headers` wins over the deprecated access token, matching JS.
-            **(
-                {"Authorization": f"Bearer {config.access_token}"}
-                if config.access_token is not None
-                else {}
-            ),
             **(config.headers or {}),
         }
 
@@ -160,18 +298,13 @@ class ApiClient(AuthenticatedClient):
         kwargs.pop("prefix", None)
 
         httpx_args = {
-            "event_hooks": {
-                "request": [self._log_request],
-                "response": [self._log_response],
-            },
+            "event_hooks": self._logging_event_hooks(),
         }
         if transport is not None:
+            # The proxy lives in the transport; passing `proxy` here too
+            # would mount a fresh, never-closed proxy transport per client.
             httpx_args["transport"] = transport
-        if (
-            transport is None
-            and transport_factory is None
-            and async_transport_factory is None
-        ):
+        else:
             httpx_args["proxy"] = config.proxy
 
         # config.request_timeout is None when the timeout is explicitly
@@ -189,70 +322,15 @@ class ApiClient(AuthenticatedClient):
             **kwargs,
         )
 
-    def _headers_with_auth(self) -> dict:
-        return {
-            **self._headers,
-            self.auth_header_name: (
-                f"{self.prefix} {self.token}" if self.prefix else self.token
-            ),
-        }
-
-    def get_httpx_client(self) -> httpx.Client:
-        if self._client is not None or self._transport_factory is None:
-            return super().get_httpx_client()
-
-        client = getattr(self._thread_local, "client", None)
-        if client is None:
-            client = httpx.Client(
-                base_url=self._base_url,
-                cookies=self._cookies,
-                headers=self._headers_with_auth(),
-                timeout=self._timeout,
-                verify=self._verify_ssl,
-                follow_redirects=self._follow_redirects,
-                event_hooks=self._httpx_args.get("event_hooks"),
-                transport=self._transport_factory(),
-            )
-            self._thread_local.client = client
-        return client
-
-    def get_async_httpx_client(self) -> httpx.AsyncClient:
-        if self._async_client is not None or self._async_transport_factory is None:
-            return super().get_async_httpx_client()
-
-        loop = asyncio.get_running_loop()
-        client = self._async_clients.get(loop)
-        if client is None:
-            client = httpx.AsyncClient(
-                base_url=self._base_url,
-                cookies=self._cookies,
-                headers=self._headers_with_auth(),
-                timeout=self._timeout,
-                verify=self._verify_ssl,
-                follow_redirects=self._follow_redirects,
-                event_hooks=self._httpx_args.get("event_hooks"),
-                transport=self._async_transport_factory(),
-            )
-            self._async_clients[loop] = client
-        return client
-
-    def _log_request(self, request):
-        logger.info(f"Request {request.method} {request.url}")
-
-    def _log_response(self, response: Response):
-        if response.status_code >= 400:
-            logger.error(f"Response {response.status_code}")
-        else:
-            logger.info(f"Response {response.status_code}")
+    def _logging_event_hooks(self) -> dict:
+        return make_logging_event_hooks(
+            self._logger, include_diagnostics=self._include_diagnostics
+        )
 
 
 # We need to override the logging hooks for the async usage
 class AsyncApiClient(ApiClient):
-    async def _log_request(self, request):
-        logger.info(f"Request {request.method} {request.url}")
-
-    async def _log_response(self, response: Response):
-        if response.status_code >= 400:
-            logger.error(f"Response {response.status_code}")
-        else:
-            logger.info(f"Response {response.status_code}")
+    def _logging_event_hooks(self) -> dict:
+        return make_async_logging_event_hooks(
+            self._logger, include_diagnostics=self._include_diagnostics
+        )

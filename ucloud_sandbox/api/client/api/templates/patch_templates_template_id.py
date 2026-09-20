@@ -44,6 +44,10 @@ def _parse_response(
         response_401 = Error.from_dict(response.json())
 
         return response_401
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -72,6 +76,8 @@ def sync_detailed(
     body: TemplateUpdateRequest,
 ) -> Response[Union[Any, Error]]:
     """Update template
+
+     Update template
 
     Args:
         template_id (str):
@@ -105,6 +111,8 @@ def sync(
 ) -> Optional[Union[Any, Error]]:
     """Update template
 
+     Update template
+
     Args:
         template_id (str):
         body (TemplateUpdateRequest):
@@ -131,6 +139,8 @@ async def asyncio_detailed(
     body: TemplateUpdateRequest,
 ) -> Response[Union[Any, Error]]:
     """Update template
+
+     Update template
 
     Args:
         template_id (str):
@@ -161,6 +171,8 @@ async def asyncio(
     body: TemplateUpdateRequest,
 ) -> Optional[Union[Any, Error]]:
     """Update template
+
+     Update template
 
     Args:
         template_id (str):

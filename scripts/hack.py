@@ -11,19 +11,32 @@ REPO_ROOT = Path(
 )
 PACKAGE_DIR = REPO_ROOT / "ucloud_sandbox"
 DOCS_URL = "https://astraflow.ucloud.cn/docs/agent-sandbox/product/01-prerequisites"
-DEFAULT_DOMAIN = "cn-wlcb.sandbox.ucloudai.com"
-BASE_IMAGE = "uhub.service.ucloud.cn/agentbox/e2bdev/base:latest"
+DEFAULT_REGION = "cn-wlcb"
+DEFAULT_DOMAIN = f"{DEFAULT_REGION}.sandbox.ucloudai.com"
+CN_BASE_IMAGE = "uhub.service.ucloud.cn/agent-sandbox-public/base_cn:latest"
+DEFAULT_BASE_IMAGE = "uhub.service.ucloud.cn/agent-sandbox-public/base:latest"
 DOMAIN_CONFIG_PATH = PACKAGE_DIR / "domain_config.py"
 DOMAIN_CONFIG_IMPORT = (
     "from ucloud_sandbox.domain_config import get_ucloud_sandbox_domain\n"
 )
 DOMAIN_CONFIG_SOURCE = f'''import os
 
+from typing import Optional
 
-DEFAULT_DOMAIN = "{DEFAULT_DOMAIN}"
+
+DEFAULT_REGION = "{DEFAULT_REGION}"
+DEFAULT_DOMAIN = f"{{DEFAULT_REGION}}.sandbox.ucloudai.com"
 REGION_ENV_VAR = "UCLOUD_SANDBOX_REGION"
 DOMAIN_ENV_VAR = "UCLOUD_SANDBOX_DOMAIN"
 DOMAIN_SUFFIX = "sandbox.ucloudai.com"
+
+CN_BASE_IMAGE = "{CN_BASE_IMAGE}"
+DEFAULT_BASE_IMAGE = "{DEFAULT_BASE_IMAGE}"
+CN_REGION_PREFIXES = ("cn", "gray")
+
+
+def get_ucloud_sandbox_region() -> str:
+    return os.getenv(REGION_ENV_VAR, "").strip() or DEFAULT_REGION
 
 
 def get_ucloud_sandbox_domain() -> str:
@@ -32,16 +45,57 @@ def get_ucloud_sandbox_domain() -> str:
         return f"{{region}}.{{DOMAIN_SUFFIX}}"
 
     return os.getenv(DOMAIN_ENV_VAR) or DEFAULT_DOMAIN
+
+
+def is_region_cn(region: Optional[str] = None) -> bool:
+    """
+    Whether the region is a CN region.
+
+    :param region: Region to check, defaults to the currently configured region
+    :return: `True` for regions starting with "cn" or "gray"
+    """
+    if region is None:
+        region = get_ucloud_sandbox_region()
+
+    return region.strip().lower().startswith(CN_REGION_PREFIXES)
+
+
+def get_default_base_image() -> str:
+    if is_region_cn():
+        return CN_BASE_IMAGE
+
+    return DEFAULT_BASE_IMAGE
 '''
 
-TRAFFIC_HEADER = "E2B-Traffic-Access-Token"
-TRAFFIC_HEADER_PLACEHOLDER = "__UCLOUD_SANDBOX_KEEP_TRAFFIC_ACCESS_TOKEN__"
+# Server-side protocol headers. They are part of the wire contract rather than
+# brand copy, so they must survive the `E2B` -> `UCloud Sandbox` rewrite.
+PROTOCOL_HEADERS = {
+    "E2B-Traffic-Access-Token": "__UCLOUD_SANDBOX_KEEP_TRAFFIC_ACCESS_TOKEN__",
+    "X-E2B-Trace-ID": "__UCLOUD_SANDBOX_KEEP_TRACE_ID__",
+}
+
+# Upstream exposes a client class literally named `E2B`. The generic
+# `\bE2B\b` -> `UCloud Sandbox` rewrite would turn it into a syntax error, so
+# identifiers are renamed first, before any prose replacement runs.
+CLIENT_CLASS = "UCloudSandbox"
+
+CLIENT_IDENTIFIER_REPLACEMENTS = [
+    (r"\bE2BClientParams\b", f"{CLIENT_CLASS}ClientParams"),
+    (r"\bCoreE2B\b", f"Core{CLIENT_CLASS}"),
+    (r"\bclass E2B\b", f"class {CLIENT_CLASS}"),
+    (r"(?<=\bimport )E2B\b", CLIENT_CLASS),
+    (r"\bE2B(?=\()", CLIENT_CLASS),
+    (r'"E2B"', f'"{CLIENT_CLASS}"'),
+    (r":class:`e2b\.E2B`", f":class:`ucloud_sandbox.{CLIENT_CLASS}`"),
+    (r":class:`E2B`", f":class:`{CLIENT_CLASS}`"),
+]
 
 ENV_REPLACEMENTS = {
     "E2B_MAX_KEEPALIVE_CONNECTIONS": "UCLOUD_SANDBOX_MAX_KEEPALIVE_CONNECTIONS",
     "E2B_KEEPALIVE_EXPIRY": "UCLOUD_SANDBOX_KEEPALIVE_EXPIRY",
     "E2B_CONNECTION_RETRIES": "UCLOUD_SANDBOX_CONNECTION_RETRIES",
-    "E2B_VALIDATE_API_KEY": "UCLOUD_SANDBOX_VALIDATE_API_KEY",
+    "E2B_ENVD_POOL_SHARDS": "UCLOUD_SANDBOX_ENVD_POOL_SHARDS",
+    "E2B_USER_AGENT_SOURCE": "UCLOUD_SANDBOX_USER_AGENT_SOURCE",
     "E2B_VOLUME_API_URL": "UCLOUD_SANDBOX_VOLUME_API_URL",
     "E2B_MAX_CONNECTIONS": "UCLOUD_SANDBOX_MAX_CONNECTIONS",
     "E2B_SANDBOX_URL": "UCLOUD_SANDBOX_URL",
@@ -68,6 +122,24 @@ def replace_imports(text: str) -> str:
         "import e2b_code_interpreter",
         "import ucloud_sandbox.code_interpreter",
     )
+    text = text.replace(
+        "from e2b_desktop.",
+        "from ucloud_sandbox.desktop.",
+    )
+    text = text.replace(
+        "from e2b_desktop import",
+        "from ucloud_sandbox.desktop import",
+    )
+    text = text.replace(
+        "import e2b_desktop",
+        "import ucloud_sandbox.desktop",
+    )
+    return text
+
+
+def replace_client_identifiers(text: str) -> str:
+    for pattern, replacement in CLIENT_IDENTIFIER_REPLACEMENTS:
+        text = re.sub(pattern, replacement, text)
     return text
 
 
@@ -84,8 +156,8 @@ def replace_branding(text: str) -> str:
     text = text.replace("e2b.pro", DEFAULT_DOMAIN)
     text = text.replace("e2b-staging.dev", DEFAULT_DOMAIN)
 
-    text = re.sub(r"(?<!/)e2bdev/base:latest", BASE_IMAGE, text)
-    text = text.replace('"e2bdev/base"', f'"{BASE_IMAGE}"')
+    text = re.sub(r"(?<!/)e2bdev/base:latest", DEFAULT_BASE_IMAGE, text)
+    text = text.replace('"e2bdev/base"', f'"{DEFAULT_BASE_IMAGE}"')
     text = text.replace('api_key="e2b_..."', 'api_key="..."')
 
     text = re.sub(r"\bE2B\b", "UCloud Sandbox", text)
@@ -111,33 +183,6 @@ def add_domain_config_import(text: str) -> str:
     return text.replace(metadata_import, metadata_import + DOMAIN_CONFIG_IMPORT)
 
 
-def patch_api_key_validation(path: Path, text: str) -> str:
-    if path != PACKAGE_DIR / "api" / "__init__.py":
-        return text
-
-    replacement = f'''_API_KEY_PATTERN = re.compile(r"\\A.+\\Z")
-
-
-def validate_api_key(api_key: str) -> None:
-    """Validate that a UCloud Sandbox API key is not empty."""
-    if not _API_KEY_PATTERN.match(api_key):
-        raise AuthenticationException(
-            "Invalid API key format. Set `UCLOUD_SANDBOX_API_KEY` "
-            "or pass `api_key` directly. See {DOCS_URL}."
-        )
-'''
-
-    text, count = re.subn(
-        r"_API_KEY_PATTERN = .*?\n\n\ndef validate_api_key\(api_key: str\) -> None:\n.*?(?=\n\nclass ApiClient)",
-        lambda _: replacement,
-        text,
-        flags=re.DOTALL,
-    )
-    if count != 1:
-        raise RuntimeError(f"Failed to patch API key validation in {path}")
-    return text
-
-
 def patch_connection_config(path: Path, text: str) -> str:
     if path == PACKAGE_DIR / "connection_config.py":
         text = add_domain_config_import(text)
@@ -148,16 +193,6 @@ def patch_connection_config(path: Path, text: str) -> str:
         text = text.replace(
             'return os.getenv("UCLOUD_SANDBOX_DOMAIN") or "cn-wlcb.sandbox.ucloudai.com"',
             "return get_ucloud_sandbox_domain()",
-        )
-        text = text.replace(
-            'return os.getenv("UCLOUD_SANDBOX_VALIDATE_API_KEY", "true").lower() != "false"',
-            'return os.getenv("UCLOUD_SANDBOX_VALIDATE_API_KEY", "false").lower() == "true"',
-        )
-        text = text.replace(
-            "    default `e2b_` format. Defaults to `UCLOUD_SANDBOX_VALIDATE_API_KEY` environment\n"
-            "    variable or `True`.",
-            "    validation is disabled by default. Set `UCLOUD_SANDBOX_VALIDATE_API_KEY=true`\n"
-            "    to enable a non-empty API key check.",
         )
         text = text.replace(
             "UCloud Sandbox domain to use for authentication, defaults to `UCLOUD_SANDBOX_DOMAIN` environment variable.",
@@ -196,8 +231,75 @@ def patch_connection_config(path: Path, text: str) -> str:
 
 def replace_once(path: Path, text: str, old: str, new: str) -> str:
     if old not in text:
-        raise RuntimeError(f"Failed to apply insecure HTTP patch in {path}")
+        raise RuntimeError(f"Failed to find patch anchor in {path}: {old!r}")
     return text.replace(old, new, 1)
+
+
+def patch_template_base_image(path: Path, text: str) -> str:
+    """
+    Resolve the default template base image through `get_default_base_image()`
+    instead of the constant the branding pass writes, so CN regions get the
+    cn-tagged image.
+    """
+    if path != PACKAGE_DIR / "template" / "main.py":
+        return text
+
+    if "get_default_base_image()" in text:
+        return text
+
+    exceptions_import = (
+        "from ucloud_sandbox.exceptions import BuildException, InvalidArgumentException\n"
+    )
+    text = replace_once(
+        path,
+        text,
+        exceptions_import,
+        "from ucloud_sandbox.domain_config import get_default_base_image\n"
+        + exceptions_import,
+    )
+    text = replace_once(
+        path,
+        text,
+        f'        self._default_base_image: str = "{DEFAULT_BASE_IMAGE}"\n',
+        "        self._default_base_image: str = get_default_base_image()\n",
+    )
+    return text
+
+
+def patch_domain_config_exports(path: Path, text: str) -> str:
+    """Re-export the UCloud domain config helpers from the package root."""
+    if path != PACKAGE_DIR / "__init__.py":
+        return text
+
+    if "from .domain_config import" in text:
+        return text
+
+    volume_import = (
+        "from .volume.connection_config import VolumeApiParams, VolumeConnectionConfig\n"
+    )
+    text = replace_once(
+        path,
+        text,
+        volume_import,
+        "from .domain_config import (\n"
+        "    get_default_base_image,\n"
+        "    get_ucloud_sandbox_domain,\n"
+        "    get_ucloud_sandbox_region,\n"
+        "    is_region_cn,\n"
+        ")\n" + volume_import,
+    )
+    text = replace_once(
+        path,
+        text,
+        '    "Username",\n',
+        '    "Username",\n'
+        "    # Domain config\n"
+        '    "get_ucloud_sandbox_domain",\n'
+        '    "get_ucloud_sandbox_region",\n'
+        '    "get_default_base_image",\n'
+        '    "is_region_cn",\n',
+    )
+    return text
 
 
 def patch_insecure_http(path: Path, text: str) -> str:
@@ -233,10 +335,10 @@ def patch_insecure_http(path: Path, text: str) -> str:
             path,
             text,
             "        sandbox_url: Optional[str] = None,\n"
-            "        access_token: Optional[str] = None,\n",
+            "        request_timeout: Optional[float] = None,\n",
             "        sandbox_url: Optional[str] = None,\n"
             "        insecure_http: Optional[bool] = None,\n"
-            "        access_token: Optional[str] = None,\n",
+            "        request_timeout: Optional[float] = None,\n",
         )
         text = replace_once(
             path,
@@ -441,19 +543,30 @@ def patch_insecure_http(path: Path, text: str) -> str:
         PACKAGE_DIR / "code_interpreter" / "code_interpreter_sync.py",
         PACKAGE_DIR / "code_interpreter" / "code_interpreter_async.py",
     }:
-        old = (
+        if "return self.get_url(JUPYTER_PORT)\n" in text:
+            return text
+
+        text = replace_once(
+            path,
+            text,
             "        return f\"{'http' if self.connection_config.debug else 'https'}://"
-            '{self.get_host(JUPYTER_PORT)}"\n'
+            '{self.get_host(JUPYTER_PORT)}"\n',
+            "        return self.get_url(JUPYTER_PORT)\n",
         )
-        if old in text:
-            text = text.replace(old, "        return self.get_url(JUPYTER_PORT)\n", 1)
 
     if path == PACKAGE_DIR / "desktop" / "main.py":
-        text = text.replace(
+        if 'get_url(self._port, "/vnc.html")' in text:
+            return text
+
+        text = replace_once(
+            path,
+            text,
             'self._url = f"https://{desktop.get_host(self._port)}/vnc.html"',
             'self._url = desktop.get_url(self._port, "/vnc.html")',
         )
-        text = text.replace(
+        text = replace_once(
+            path,
+            text,
             'self._url = f"https://{self.__desktop.get_host(self._port)}/vnc.html"',
             'self._url = self.__desktop.get_url(self._port, "/vnc.html")',
         )
@@ -519,16 +632,22 @@ def ensure_domain_config() -> bool:
 
 def patch_file(path: Path) -> bool:
     original = path.read_text()
-    text = original.replace(TRAFFIC_HEADER, TRAFFIC_HEADER_PLACEHOLDER)
+
+    text = original
+    for header, placeholder in PROTOCOL_HEADERS.items():
+        text = text.replace(header, placeholder)
 
     text = replace_imports(text)
     text = replace_env_vars(text)
+    text = replace_client_identifiers(text)
     text = replace_branding(text)
-    text = patch_api_key_validation(path, text)
     text = patch_connection_config(path, text)
     text = patch_insecure_http(path, text)
+    text = patch_template_base_image(path, text)
+    text = patch_domain_config_exports(path, text)
 
-    text = text.replace(TRAFFIC_HEADER_PLACEHOLDER, TRAFFIC_HEADER)
+    for header, placeholder in PROTOCOL_HEADERS.items():
+        text = text.replace(placeholder, header)
 
     if text != original:
         path.write_text(text)

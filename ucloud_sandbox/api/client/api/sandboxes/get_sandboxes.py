@@ -49,6 +49,10 @@ def _parse_response(
         response_401 = Error.from_dict(response.json())
 
         return response_401
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -75,7 +79,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     metadata: Union[Unset, str] = UNSET,
 ) -> Response[Union[Error, list["ListedSandbox"]]]:
-    """List all running sandboxes
+    """List running sandboxes
+
+     List all running sandboxes. Use GET /v2/sandboxes instead.
 
     Args:
         metadata (Union[Unset, str]):
@@ -104,7 +110,9 @@ def sync(
     client: AuthenticatedClient,
     metadata: Union[Unset, str] = UNSET,
 ) -> Optional[Union[Error, list["ListedSandbox"]]]:
-    """List all running sandboxes
+    """List running sandboxes
+
+     List all running sandboxes. Use GET /v2/sandboxes instead.
 
     Args:
         metadata (Union[Unset, str]):
@@ -128,7 +136,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     metadata: Union[Unset, str] = UNSET,
 ) -> Response[Union[Error, list["ListedSandbox"]]]:
-    """List all running sandboxes
+    """List running sandboxes
+
+     List all running sandboxes. Use GET /v2/sandboxes instead.
 
     Args:
         metadata (Union[Unset, str]):
@@ -155,7 +165,9 @@ async def asyncio(
     client: AuthenticatedClient,
     metadata: Union[Unset, str] = UNSET,
 ) -> Optional[Union[Error, list["ListedSandbox"]]]:
-    """List all running sandboxes
+    """List running sandboxes
+
+     List all running sandboxes. Use GET /v2/sandboxes instead.
 
     Args:
         metadata (Union[Unset, str]):

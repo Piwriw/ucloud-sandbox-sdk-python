@@ -1,10 +1,14 @@
 import asyncio
+import os
 from types import TracebackType
-from typing import Callable, Optional, List, Union
+from typing import Callable, Dict, Optional, List, Union
 
 import httpx
+from pyqwest import HTTPTransport
+from pyqwest.httpx import AsyncPyqwestTransport
 
-from ucloud_sandbox.api import handle_api_exception
+from ucloud_sandbox.api import encode_path_param, handle_api_exception, proxy_to_config
+from ucloud_sandbox.io_utils import aiter_io_chunks
 from ucloud_sandbox.api.client.api.templates import (
     post_v3_templates,
     get_templates_template_id_files_hash,
@@ -37,6 +41,7 @@ from ucloud_sandbox.template.types import (
     TemplateTag,
     TemplateTagInfo,
 )
+from ucloud_sandbox.template.consts import FILE_UPLOAD_TIMEOUT_SECONDS
 from ucloud_sandbox.template.utils import get_build_step_index, tar_file_stream
 
 
@@ -46,6 +51,7 @@ async def request_build(
     tags: Optional[List[str]],
     cpu_count: int,
     memory_mb: int,
+    min_free_disk_mb: Optional[int],
 ):
     res = await post_v3_templates.asyncio_detailed(
         client=client,
@@ -54,6 +60,9 @@ async def request_build(
             tags=tags if tags else UNSET,
             cpu_count=cpu_count,
             memory_mb=memory_mb,
+            min_free_disk_mb=(
+                min_free_disk_mb if min_free_disk_mb is not None else UNSET
+            ),
         ),
     )
 
@@ -76,7 +85,7 @@ async def get_file_upload_link(
     stack_trace: Optional[TracebackType] = None,
 ) -> TemplateBuildFileUpload:
     res = await get_templates_template_id_files_hash.asyncio_detailed(
-        template_id=template_id,
+        template_id=encode_path_param(template_id),
         hash_=files_hash,
         client=client,
     )
@@ -104,22 +113,69 @@ async def upload_file(
     url: str,
     ignore_patterns: List[str],
     resolve_symlinks: bool,
+    gzip: bool,
     stack_trace: Optional[TracebackType],
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    request_timeout: Optional[float] = None,
 ):
+    # Uploading a large build-context archive can take far longer than the 60s
+    # general API timeout, so default to a 1-hour upload timeout unless the
+    # caller set an explicit request_timeout. Matches the JS SDK
+    # (FILE_UPLOAD_TIMEOUT_MS).
+    upload_timeout = (
+        request_timeout if request_timeout is not None else FILE_UPLOAD_TIMEOUT_SECONDS
+    )
+    upload_proxy = proxy_to_config(getattr(api_client, "_proxy", None))
     try:
-        tar_buffer = tar_file_stream(
-            file_name, context_path, ignore_patterns, resolve_symlinks
+        tar_file = tar_file_stream(
+            file_name, context_path, ignore_patterns, resolve_symlinks, gzip
         )
+        try:
+            size = os.fstat(tar_file.fileno()).st_size
 
-        async with httpx.AsyncClient(
-            timeout=api_client._timeout,
-            verify=api_client._verify_ssl,
-            follow_redirects=api_client._follow_redirects,
-            proxy=getattr(api_client, "_proxy", None),
-            http2=False,
-        ) as client:
-            response = await client.put(url, content=tar_buffer.getvalue())
-        response.raise_for_status()
+            # Through the pyqwest adapter the upload timeout is a
+            # whole-request deadline for the entire transfer, not a per-write
+            # bound as with the httpx transport this replaced.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(upload_timeout),
+                follow_redirects=api_client._follow_redirects,
+                transport=AsyncPyqwestTransport(
+                    HTTPTransport(
+                        tls_include_system_certs=True,
+                        proxy=(
+                            upload_proxy.to_pyqwest()
+                            if upload_proxy is not None
+                            else None
+                        ),
+                        # Redirects belong to the httpx client above, not to
+                        # reqwest.
+                        follow_redirects=False,
+                    )
+                ),
+            ) as client:
+                # API-returned headers applied as given, but Content-Length stays ours — explicit so S3 presigned URLs see no chunked encoding.
+                response = await client.put(
+                    url,
+                    content=aiter_io_chunks(tar_file),
+                    headers={
+                        **{
+                            k: v
+                            for k, v in (headers or {}).items()
+                            if k.lower() != "content-length"
+                        },
+                        "Content-Length": str(size),
+                    },
+                )
+            response.raise_for_status()
+        finally:
+            # Closing the spooled temp file is best-effort: a failure here
+            # must not mask a successful upload as a FileUploadException,
+            # nor overwrite a real upload error.
+            try:
+                tar_file.close()
+            except Exception:
+                pass
     except httpx.HTTPStatusError as e:
         raise FileUploadException(f"Failed to upload file: {e}").with_traceback(
             stack_trace
@@ -140,7 +196,7 @@ async def trigger_build(
     template_data = TemplateBuildStartV2.from_dict(template)
 
     res = await post_v_2_templates_template_id_builds_build_id.asyncio_detailed(
-        template_id=template_id,
+        template_id=encode_path_param(template_id),
         build_id=build_id,
         client=client,
         body=template_data,
@@ -181,7 +237,7 @@ async def get_build_status(
     client: AuthenticatedClient, template_id: str, build_id: str, logs_offset: int
 ) -> TemplateBuildStatusResponse:
     res = await get_templates_template_id_builds_build_id_status.asyncio_detailed(
-        template_id=template_id,
+        template_id=encode_path_param(template_id),
         build_id=build_id,
         client=client,
         logs_offset=logs_offset,
@@ -278,7 +334,7 @@ async def check_alias_exists(client: AuthenticatedClient, alias: str) -> bool:
         True if the alias exists, False otherwise
     """
     res = await get_templates_aliases_alias.asyncio_detailed(
-        alias=alias,
+        alias=encode_path_param(alias),
         client=client,
     )
 
@@ -357,17 +413,17 @@ async def remove_tags(client: AuthenticatedClient, name: str, tags: List[str]) -
 
 
 async def get_template_tags(
-    client: AuthenticatedClient, template_id: str
+    client: AuthenticatedClient, template_id_or_name: str
 ) -> List[TemplateTag]:
     """
     Get all tags for a template.
 
     Args:
         client: Authenticated API client
-        template_id: Template ID or name
+        template_id_or_name: Template ID or name (a name may be namespaced)
     """
     res = await get_templates_template_id_tags.asyncio_detailed(
-        template_id=template_id,
+        template_id=encode_path_param(template_id_or_name),
         client=client,
     )
 

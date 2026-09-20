@@ -207,7 +207,7 @@ class Result:
 
         return formats
 
-    def __str__(self) -> Optional[str]:
+    def __str__(self) -> str:
         """
         Returns the text representation of the data.
 
@@ -305,7 +305,12 @@ class Logs:
     stderr: List[str] = field(default_factory=list)
     """List of strings printed to stderr by prints, subprocesses, etc."""
 
-    def __init__(self, stdout: List[str] = None, stderr: List[str] = None, **kwargs):
+    def __init__(
+        self,
+        stdout: Optional[List[str]] = None,
+        stderr: Optional[List[str]] = None,
+        **kwargs,
+    ):
         self.stdout = stdout or []
         self.stderr = stderr or []
 
@@ -329,7 +334,9 @@ def serialize_results(results: List[Result]) -> List[Dict[str, str]]:
         serialized_dict = {}
         for key in result.formats():
             if key == "chart":
-                serialized_dict[key] = result.chart.to_dict()
+                chart = result.chart
+                if chart is not None:
+                    serialized_dict[key] = chart.to_dict()
             else:
                 serialized_dict[key] = result[key]
 
@@ -356,8 +363,8 @@ class Execution:
 
     def __init__(
         self,
-        results: List[Result] = None,
-        logs: Logs = None,
+        results: Optional[List[Result]] = None,
+        logs: Optional[Logs] = None,
         error: Optional[ExecutionError] = None,
         execution_count: Optional[int] = None,
         **kwargs,
@@ -393,34 +400,41 @@ class Execution:
         return json.dumps(data)
 
 
-async def aextract_exception(res: Response):
+async def aextract_exception(res: Response, include_diagnostics: bool = False):
     if res.is_success:
         return None
 
     await res.aread()
-    return extract_exception(res)
+    return extract_exception(res, include_diagnostics)
 
 
-def extract_exception(res: Response):
+def extract_exception(res: Response, include_diagnostics: bool = False):
     if res.is_success:
         return None
 
     res.read()
-    return format_exception(res)
+    return format_exception(res, include_diagnostics)
 
 
-def format_exception(res: Response):
+def format_exception(res: Response, include_diagnostics: bool = False):
     if res.is_success:
         return None
 
+    body = res.text
+    trace_id = res.headers.get("X-E2B-Trace-ID") if include_diagnostics else None
+    trace_suffix = f" (trace_id={trace_id})" if trace_id else ""
+
     if res.status_code == 404:
-        return NotFoundException(res.text)
+        return NotFoundException(f"{body}{trace_suffix}")
     elif res.status_code == 502:
         return TimeoutException(
-            f"{res.text}: This error is likely due to sandbox timeout. You can modify the sandbox timeout by passing 'timeout' when starting the sandbox or calling '.set_timeout' on the sandbox with the desired timeout."
+            f"{body}: This error is likely due to sandbox timeout. You can modify the sandbox timeout by passing 'timeout' when starting the sandbox or calling '.set_timeout' on the sandbox with the desired timeout.{trace_suffix}"
         )
     else:
-        return SandboxException(f"{res.status_code}: {res.text}")
+        body_separator = "" if trace_suffix and not body else " "
+        return SandboxException(
+            f"{res.status_code}:{body_separator}{body}{trace_suffix}"
+        )
 
 
 def parse_output(
@@ -510,7 +524,7 @@ class Context:
     @classmethod
     def from_json(cls, data: Dict[str, str]):
         return cls(
-            context_id=data.get("id"),
-            language=data.get("language"),
-            cwd=data.get("cwd"),
+            context_id=data["id"],
+            language=data["language"],
+            cwd=data["cwd"],
         )

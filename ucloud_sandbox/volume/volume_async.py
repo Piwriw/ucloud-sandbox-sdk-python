@@ -1,10 +1,11 @@
+import asyncio
+
 from typing import AsyncIterator, IO, List, Literal, Optional, Union, cast, overload
 from http import HTTPStatus
 
 import httpx
 
-from httpx._types import ProxyTypes
-from typing_extensions import Unpack
+from typing_extensions import Self, Unpack
 
 from ucloud_sandbox.api import handle_api_exception
 from ucloud_sandbox.api.client.api.volumes import (
@@ -19,8 +20,18 @@ from ucloud_sandbox.api.client.models import (
 )
 from ucloud_sandbox.api.client.types import Response
 from ucloud_sandbox.api.client_async import get_api_client as get_core_api_client
-from ucloud_sandbox.connection_config import ApiParams, ConnectionConfig
-from ucloud_sandbox.exceptions import NotFoundException, VolumeException
+from ucloud_sandbox.connection_config import (
+    ApiParams,
+    ClientFactory,
+    ConnectionConfig,
+    ProxyTypes,
+)
+from ucloud_sandbox.exceptions import (
+    NotFoundException,
+    VolumeException,
+    VolumeNotFoundException,
+    VolumePathNotFoundException,
+)
 from ucloud_sandbox.volume.client.api.volumes import (
     get_volumecontent_volume_id_path as get_path,
     get_volumecontent_volume_id_dir as get_dir,
@@ -36,6 +47,9 @@ from ucloud_sandbox.volume.client.models import (
 )
 from ucloud_sandbox.volume.client.types import File as FilePayload, UNSET
 from ucloud_sandbox.volume.client_async import get_api_client as get_volume_api_client
+from ucloud_sandbox.volume.client_async import (
+    get_streaming_api_client as get_streaming_volume_api_client,
+)
 from ucloud_sandbox.volume.connection_config import (
     VolumeApiParams,
     VolumeConnectionConfig,
@@ -46,10 +60,14 @@ from ucloud_sandbox.volume.types import (
     VolumeInfo,
     VolumeEntryStat,
 )
-from ucloud_sandbox.volume.utils import DualMethod, convert_volume_entry_stat
+from ucloud_sandbox.io_utils import aiter_io_chunks
+from ucloud_sandbox.volume.utils import (
+    DualMethod,
+    convert_volume_entry_stat,
+)
 
 
-class AsyncVolume:
+class AsyncVolume(ClientFactory):
     """UCloud Sandbox Volume for persistent storage that can be mounted to sandboxes (async)."""
 
     def __init__(
@@ -97,11 +115,12 @@ class AsyncVolume:
             api_url=opts.get("api_url"),
             request_timeout=opts.get("request_timeout"),
             headers=opts.get("headers"),
+            logger=opts.get("logger"),
             proxy=opts.get("proxy") if opts.get("proxy") is not None else self._proxy,
         )
 
     @classmethod
-    async def create(cls, name: str, **opts: Unpack[ApiParams]) -> "AsyncVolume":
+    async def create(cls, name: str, **opts: Unpack[ApiParams]) -> Self:
         """
         Create a new volume.
 
@@ -109,7 +128,7 @@ class AsyncVolume:
 
         :return: An AsyncVolume instance for the new volume
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         api_client = get_core_api_client(config)
         res = await post_volumes.asyncio_detailed(
@@ -126,11 +145,16 @@ class AsyncVolume:
         if isinstance(res.parsed, Error):
             raise Exception(f"{res.parsed.message}: Request failed")
 
+        domain = (
+            res.parsed.domain
+            if isinstance(res.parsed.domain, str) and res.parsed.domain
+            else None
+        )
         vol = cls(
             volume_id=res.parsed.volume_id,
             name=res.parsed.name,
             token=res.parsed.token,
-            domain=config.domain,
+            domain=domain or config.domain,
             debug=config.debug,
             insecure_http=config.insecure_http,
             proxy=config.proxy,
@@ -138,7 +162,7 @@ class AsyncVolume:
         return vol
 
     @classmethod
-    async def connect(cls, volume_id: str, **opts: Unpack[ApiParams]) -> "AsyncVolume":
+    async def connect(cls, volume_id: str, **opts: Unpack[ApiParams]) -> Self:
         """
         Connect to an existing volume by ID.
 
@@ -147,20 +171,20 @@ class AsyncVolume:
         :return: An AsyncVolume instance for the existing volume
         """
         info = await cls.get_info(volume_id, **opts)
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
         return cls(
             volume_id=volume_id,
             name=info.name,
             token=info.token,
-            domain=config.domain,
+            domain=info.domain or config.domain,
             debug=config.debug,
             insecure_http=config.insecure_http,
             proxy=config.proxy,
         )
 
-    @staticmethod
+    @classmethod
     async def _class_get_info(
-        volume_id: str, **opts: Unpack[ApiParams]
+        cls, volume_id: str, **opts: Unpack[ApiParams]
     ) -> VolumeAndToken:
         """
         Get information about a volume.
@@ -169,7 +193,7 @@ class AsyncVolume:
 
         :return: Volume info
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         api_client = get_core_api_client(config)
         res = await get_volumes_volume_id.asyncio_detailed(
@@ -178,7 +202,7 @@ class AsyncVolume:
         )
 
         if res.status_code == 404:
-            raise NotFoundException(f"Volume {volume_id} not found")
+            raise VolumeNotFoundException(f"Volume {volume_id} not found")
 
         if res.status_code >= 300:
             raise handle_api_exception(res, VolumeException)
@@ -189,20 +213,26 @@ class AsyncVolume:
         if isinstance(res.parsed, Error):
             raise Exception(f"{res.parsed.message}: Request failed")
 
+        domain = (
+            res.parsed.domain
+            if isinstance(res.parsed.domain, str) and res.parsed.domain
+            else None
+        )
         return VolumeAndToken(
             volume_id=res.parsed.volume_id,
             name=res.parsed.name,
             token=res.parsed.token,
+            domain=domain,
         )
 
-    @staticmethod
-    async def _class_list(**opts: Unpack[ApiParams]) -> List[VolumeInfo]:
+    @classmethod
+    async def _class_list(cls, **opts: Unpack[ApiParams]) -> List[VolumeInfo]:
         """
         List all volumes.
 
         :return: List of volumes
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         api_client = get_core_api_client(config)
         res = await get_volumes.asyncio_detailed(
@@ -220,14 +250,14 @@ class AsyncVolume:
 
         return [VolumeInfo(volume_id=v.volume_id, name=v.name) for v in res.parsed]
 
-    @staticmethod
-    async def destroy(volume_id: str, **opts: Unpack[ApiParams]) -> bool:
+    @classmethod
+    async def destroy(cls, volume_id: str, **opts: Unpack[ApiParams]) -> bool:
         """
         Destroy a volume.
 
         :param volume_id: Volume ID
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
 
         api_client = get_core_api_client(config)
         res = await delete_volumes_volume_id.asyncio_detailed(
@@ -266,7 +296,7 @@ class AsyncVolume:
         )
 
         if res.status_code == 404:
-            raise NotFoundException(f"Path {path} not found")
+            raise VolumePathNotFoundException(f"Path {path} not found")
 
         if res.status_code >= 300:
             raise handle_api_exception(res, VolumeException)
@@ -318,7 +348,7 @@ class AsyncVolume:
         )
 
         if res.status_code == 404:
-            raise NotFoundException(f"Path {path} not found")
+            raise VolumePathNotFoundException(f"Path {path} not found")
 
         if res.status_code >= 300:
             raise handle_api_exception(res, VolumeException)
@@ -370,7 +400,7 @@ class AsyncVolume:
         )
 
         if res.status_code == 404:
-            raise NotFoundException(f"Path {path} not found")
+            raise VolumePathNotFoundException(f"Path {path} not found")
 
         if res.status_code >= 300:
             raise handle_api_exception(res, VolumeException)
@@ -383,8 +413,8 @@ class AsyncVolume:
 
         return convert_volume_entry_stat(cast(VolumeEntryStatApi, res.parsed))
 
-    get_info = DualMethod(_class_get_info.__func__, _instance_get_info)
-    list = DualMethod(_class_list.__func__, _instance_list)
+    get_info = DualMethod(_class_get_info, _instance_get_info)
+    list = DualMethod(_class_list, _instance_list)
 
     async def update_metadata(
         self,
@@ -422,7 +452,7 @@ class AsyncVolume:
         )
 
         if res.status_code == 404:
-            raise NotFoundException(f"Path {path} not found")
+            raise VolumePathNotFoundException(f"Path {path} not found")
 
         if res.status_code >= 300:
             raise handle_api_exception(res, VolumeException)
@@ -453,6 +483,7 @@ class AsyncVolume:
         self,
         path: str,
         format: Literal["stream"],
+        stream_idle_timeout: Optional[float] = None,
         **opts: Unpack[VolumeApiParams],
     ) -> AsyncIterator[bytes]: ...
 
@@ -460,6 +491,7 @@ class AsyncVolume:
         self,
         path: str,
         format: Literal["text", "bytes", "stream"] = "text",
+        stream_idle_timeout: Optional[float] = None,
         **opts: Unpack[VolumeApiParams],
     ) -> Union[str, bytes, AsyncIterator[bytes]]:
         """
@@ -469,6 +501,13 @@ class AsyncVolume:
 
         :param path: Path to the file
         :param format: Format of the file content—`text` by default
+        :param stream_idle_timeout: Idle timeout in **seconds** for a streamed
+            read (`format="stream"`)—abort with `httpx.ReadTimeout` if the
+            response head or the next chunk doesn't arrive within this
+            window. Resets on every chunk, so it bounds a stalled stream
+            without limiting total transfer time. Defaults to the
+            transport-wide idle read timeout (60 seconds); pass `0` to
+            disable.
         :param opts: Connection options
 
         :return: File content as string, bytes, or async iterator of bytes
@@ -482,28 +521,68 @@ class AsyncVolume:
         )
 
         if format == "stream":
+            # Through the pyqwest adapter a per-request timeout is a
+            # whole-request deadline that would kill long downloads, so a
+            # streamed read is sent with one only when the caller set
+            # `request_timeout` explicitly (making it the total-transfer
+            # deadline).
+            stream_timeout = VolumeConnectionConfig._get_request_timeout(
+                None, opts.get("request_timeout")
+            )
+            # By default a stalled stream is bounded by the streaming
+            # transport's idle read timeout (see `get_streaming_transport`).
+            # An explicit `stream_idle_timeout` is applied per read with
+            # `wait_for` instead, on the regular transport — so values above
+            # the transport bound aren't capped by it and `0` disables idle
+            # bounding entirely. (The sync client can't interrupt a blocking
+            # read, so only the async flavor honors the per-call value.)
+            stream_client = (
+                get_streaming_volume_api_client(config)
+                if stream_idle_timeout is None
+                else api_client
+            )
+
+            async def read_bounded(awaitable):
+                if not stream_idle_timeout:
+                    return await awaitable
+                return await asyncio.wait_for(awaitable, stream_idle_timeout)
 
             async def stream_file() -> AsyncIterator[bytes]:
-                async with api_client.get_async_httpx_client().stream(
-                    method="GET",
-                    url=f"/volumecontent/{self._volume_id}/file",
-                    params=params,
-                    timeout=timeout,
-                ) as response:
-                    if response.status_code == 404:
-                        raise NotFoundException(f"Path {path} not found")
+                # `read_bounded` expires as a `wait_for` timeout; keep the
+                # httpx exception the streamed-read contract established (the
+                # transport-wide bound already surfaces as one).
+                try:
+                    stream_cm = stream_client.get_async_httpx_client().stream(
+                        method="GET",
+                        url=f"/volumecontent/{self._volume_id}/file",
+                        params=params,
+                        timeout=stream_timeout,
+                    )
+                    response = await read_bounded(stream_cm.__aenter__())
+                    try:
+                        if response.status_code == 404:
+                            raise VolumePathNotFoundException(f"Path {path} not found")
 
-                    if response.status_code >= 300:
-                        api_response = Response(
-                            status_code=HTTPStatus(response.status_code),
-                            content=await response.aread(),
-                            headers=response.headers,
-                            parsed=None,
-                        )
-                        raise handle_api_exception(api_response, VolumeException)
+                        if response.status_code >= 300:
+                            api_response = Response(
+                                status_code=HTTPStatus(response.status_code),
+                                content=await response.aread(),
+                                headers=response.headers,
+                                parsed=None,
+                            )
+                            raise handle_api_exception(api_response, VolumeException)
 
-                    async for chunk in response.aiter_bytes():
-                        yield chunk
+                        chunks = response.aiter_bytes()
+                        while True:
+                            try:
+                                chunk = await read_bounded(chunks.__anext__())
+                            except StopAsyncIteration:
+                                break
+                            yield chunk
+                    finally:
+                        await stream_cm.__aexit__(None, None, None)
+                except asyncio.TimeoutError as e:
+                    raise httpx.ReadTimeout(str(e)) from e
 
             return stream_file()
 
@@ -515,7 +594,7 @@ class AsyncVolume:
         )
 
         if response.status_code == 404:
-            raise NotFoundException(f"Path {path} not found")
+            raise VolumePathNotFoundException(f"Path {path} not found")
 
         if response.status_code >= 300:
             api_response = Response(
@@ -534,7 +613,7 @@ class AsyncVolume:
     async def write_file(
         self,
         path: str,
-        data: Union[str, bytes, IO[bytes]],
+        data: Union[str, bytes, IO],
         uid: Optional[int] = None,
         gid: Optional[int] = None,
         mode: Optional[int] = None,
@@ -548,7 +627,7 @@ class AsyncVolume:
         Writing to a file that already exists overwrites the file.
 
         :param path: Path to the file
-        :param data: Data to write to the file. Data can be a string, bytes, or IO.
+        :param data: Data to write to the file. Data can be a string, bytes, or IO. File-like objects are streamed in chunks instead of being buffered in memory.
         :param uid: User ID of the created file
         :param gid: Group ID of the created file
         :param mode: Mode of the created file
@@ -565,22 +644,21 @@ class AsyncVolume:
         if upload_timeout is not None:
             api_client = api_client.with_timeout(httpx.Timeout(upload_timeout))
 
+        content: Union[bytes, AsyncIterator[bytes]]
         if isinstance(data, str):
-            data_bytes = data.encode("utf-8")
+            content = data.encode("utf-8")
         elif isinstance(data, bytes):
-            data_bytes = data
+            content = data
         elif hasattr(data, "read"):
-            content = data.read()
-            if isinstance(content, bytes):
-                data_bytes = content
-            else:
-                data_bytes = content.encode("utf-8")
+            # Stream file-like objects in chunks without buffering them in
+            # memory. Async httpx requires an async iterable request body.
+            content = aiter_io_chunks(data)
         else:
             raise ValueError(f"Unsupported data type: {type(data)}")
 
         res = await put_file.asyncio_detailed(
             self._volume_id,
-            body=FilePayload(payload=data_bytes),  # type: ignore[arg-type]  # Pass bytes directly for async httpx compatibility
+            body=FilePayload(payload=content),  # type: ignore[arg-type]  # httpx accepts bytes and streamable content directly
             path=path,
             uid=uid if uid is not None else UNSET,
             gid=gid if gid is not None else UNSET,
@@ -590,7 +668,7 @@ class AsyncVolume:
         )
 
         if res.status_code == 404:
-            raise NotFoundException(f"Path {path} not found")
+            raise VolumePathNotFoundException(f"Path {path} not found")
 
         if res.status_code >= 300:
             raise handle_api_exception(res, VolumeException)
@@ -624,7 +702,7 @@ class AsyncVolume:
         )
 
         if res.status_code == 404:
-            raise NotFoundException(f"Path {path} not found")
+            raise VolumePathNotFoundException(f"Path {path} not found")
 
         if res.status_code >= 300:
             raise handle_api_exception(res, VolumeException)

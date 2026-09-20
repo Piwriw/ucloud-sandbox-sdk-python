@@ -9,20 +9,26 @@ import httpx
 from packaging.version import Version
 from typing_extensions import Self, Unpack
 
+from ucloud_sandbox.api.client.types import Unset
+from ucloud_sandbox.api.client_sync import get_envd_api
 from ucloud_sandbox.connection_config import ApiParams, ConnectionConfig
 from ucloud_sandbox.envd.api import ENVD_API_HEALTH_ROUTE, handle_envd_api_exception
 from ucloud_sandbox.envd.versions import ENVD_DEBUG_FALLBACK
 from ucloud_sandbox.exceptions import (
+    SandboxException,
     TemplateException,
     format_request_timeout_error,
 )
+from ucloud_sandbox.sandbox.commands.command_handle import CommandExitException
 from ucloud_sandbox.sandbox.main import SandboxOpts
 from ucloud_sandbox.sandbox.sandbox_api import (
     McpServer,
+    SandboxIamOpts,
     SandboxLifecycle,
     SandboxMetrics,
     SandboxNetworkOpts,
     SandboxNetworkUpdate,
+    SandboxOnResume,
     SnapshotInfo,
 )
 from ucloud_sandbox.sandbox.utils import class_method_variant
@@ -88,6 +94,8 @@ class Sandbox(SandboxApi):
     def git(self) -> Git:
         """
         Module for running git operations in the sandbox.
+
+        :deprecated: Run git with `sandbox.commands.run()` instead. The git module will be removed in the next major version.
         """
         return self._git
 
@@ -99,26 +107,26 @@ class Sandbox(SandboxApi):
         """
         super().__init__(**opts)
 
+        self._envd_api = get_envd_api(self.connection_config, self.envd_api_url)
         self._filesystem = Filesystem(
             self.envd_api_url,
             self._envd_version,
             self.connection_config,
+            self._envd_api,
         )
         self._commands = Commands(
             self.envd_api_url,
             self.connection_config,
             self._envd_version,
+            self._envd_api,
         )
         self._pty = Pty(
             self.envd_api_url,
             self.connection_config,
             self._envd_version,
+            self._envd_api,
         )
         self._git = Git(self._commands)
-
-    @property
-    def _envd_api(self) -> httpx.Client:
-        return self._filesystem._envd_api
 
     def is_running(self, request_timeout: Optional[float] = None) -> bool:
         """
@@ -167,8 +175,10 @@ class Sandbox(SandboxApi):
         allow_internet_access: bool = True,
         mcp: Optional[McpServer] = None,
         network: Optional[SandboxNetworkOpts] = None,
+        iam: Optional[SandboxIamOpts] = None,
         lifecycle: Optional[SandboxLifecycle] = None,
         volume_mounts: Optional[SandboxVolumeMount] = None,
+        logger: Optional[logging.Logger] = None,
         **opts: Unpack[ApiParams],
     ) -> Self:
         """
@@ -183,9 +193,11 @@ class Sandbox(SandboxApi):
         :param secure: Envd is secured with access token and cannot be used without it, defaults to `True`.
         :param allow_internet_access: Allow sandbox to access the internet, defaults to `True`. If set to `False`, it works the same as setting network `deny_out` to `[0.0.0.0/0]`.
         :param mcp: MCP server to enable in the sandbox
-        :param network: Sandbox network configuration. ``allow_out``/``deny_out`` may also be a callable receiving a :class:`SandboxNetworkSelectorContext` (``ctx.all_traffic``, ``ctx.rules``) and returning a list of strings. Per-host transform rules are nested under ``network.rules``.
-        :param lifecycle: Sandbox lifecycle configuration — ``on_timeout``: ``"kill"`` (default) or ``"pause"``; ``auto_resume``: ``False`` (default) or ``True`` (only when ``on_timeout="pause"``). Example: ``{"on_timeout": "pause", "auto_resume": True}``
+        :param network: Sandbox network configuration. ``allow_out``/``deny_out`` may also be a callable receiving a :class:`SandboxNetworkSelectorContext` (``ctx.all_traffic``, ``ctx.rules``) and returning a list of strings. Per-host transform rules are nested under ``network.rules``; a rule's ``transform`` may be a callable receiving a :class:`SandboxNetworkTransformContext` of placeholder strings (``ctx.iam.tokens[name]``).
+        :param iam: Sandbox workload identity configuration. A non-empty ``tokens`` map enables workload identity for the sandbox; token definitions can be created with :meth:`Secret.iam_token`. Example: ``{"tokens": {"aws": Secret.iam_token(audience="sts.amazonaws.com", token_type="JWT-SVID")}}``. Registered tokens are exposed to ``network.rules`` ``transform`` callables as ``ctx.iam.tokens[name]`` placeholders, which the egress proxy resolves per request
+        :param lifecycle: Sandbox lifecycle configuration — ``on_timeout``: ``"kill"`` or ``"pause"`` (omitted from the request when unset, leaving the API's default, currently ``"kill"``, in effect), or an object ``{"action": "pause"|"kill", "keep_memory": bool}`` where ``keep_memory`` set to ``False`` makes a timeout auto-pause filesystem-only (cold-boots on resume; cannot be combined with ``auto_resume``); an omitted ``keep_memory`` leaves the snapshot kind to the API; ``auto_resume``: leave unset to let the API pick the behavior, set ``False`` to opt out explicitly, or ``True`` (only when ``on_timeout`` action is ``"pause"``). Example: ``{"on_timeout": {"action": "pause", "keep_memory": False}}``
         :param volume_mounts: Dictionary mapping mount paths to Volume instances or volume names
+        :param logger: Logger used for request and response logging for this sandbox. Accepts any standard library `logging.Logger`. When omitted, no request/response logging is emitted.
 
         :return: A Sandbox instance for the new sandbox
 
@@ -215,8 +227,10 @@ class Sandbox(SandboxApi):
             allow_internet_access=allow_internet_access,
             mcp=mcp,
             network=network,
+            iam=iam,
             lifecycle=lifecycle,
             volume_mounts=transformed_mounts,
+            logger=logger,
             **opts,
         )
 
@@ -224,13 +238,22 @@ class Sandbox(SandboxApi):
             token = str(uuid.uuid4())
             sandbox._mcp_token = token
 
-            res = sandbox.commands.run(
-                f"mcp-gateway --config {shlex.quote(json.dumps(mcp))}",
-                user="root",
-                envs={"GATEWAY_ACCESS_TOKEN": token},
-            )
-            if res.exit_code != 0:
-                raise Exception(f"Failed to start MCP gateway: {res.stderr}")
+            try:
+                sandbox.commands.run(
+                    f"mcp-gateway --config {shlex.quote(json.dumps(mcp))}",
+                    user="root",
+                    envs={"GATEWAY_ACCESS_TOKEN": token},
+                )
+            except BaseException as e:
+                try:
+                    sandbox.kill()
+                except Exception:
+                    pass
+                if isinstance(e, CommandExitException):
+                    raise SandboxException(
+                        f"Failed to start MCP gateway: {e.stderr}"
+                    ) from e
+                raise
 
         return sandbox
 
@@ -238,6 +261,8 @@ class Sandbox(SandboxApi):
     def connect(
         self,
         timeout: Optional[int] = None,
+        *,
+        on_resume: SandboxOnResume = "restore",
         **opts: Unpack[ApiParams],
     ) -> Self:
         """
@@ -248,6 +273,15 @@ class Sandbox(SandboxApi):
 
         :param timeout: Timeout for the sandbox in **seconds**
             For running sandboxes, the timeout will update only if the new timeout is longer than the existing one.
+        :param on_resume: `"restore"` (the default) restores the memory snapshot; `"reboot"`
+            cold-boots from disk state, so writes not flushed before the pause may be lost.
+            Rejected where filesystem-only resume is not enabled; a no-op for a snapshot
+            without memory or a sandbox that is already running. A value outside the two
+            literals raises `InvalidArgumentException`.
+            Needs a control plane that knows this option: UCloud Sandbox Cloud, or a self-hosted or BYOC
+            deployment built from `e2b-dev/runtime` at or after the commit that added the `memory`
+            field to connect/resume (2026-08-20). An older control plane drops the field and
+            restores memory while answering as if the request had succeeded.
         :return: A running sandbox instance
 
         @example
@@ -267,6 +301,9 @@ class Sandbox(SandboxApi):
     def connect(
         sandbox_id: str,
         timeout: Optional[int] = None,
+        logger: Optional[logging.Logger] = None,
+        *,
+        on_resume: SandboxOnResume = "restore",
         **opts: Unpack[ApiParams],
     ) -> "Sandbox":
         """
@@ -278,6 +315,16 @@ class Sandbox(SandboxApi):
         :param sandbox_id: Sandbox ID
         :param timeout: Timeout for the sandbox in **seconds**.
             For running sandboxes, the timeout will update only if the new timeout is longer than the existing one.
+        :param logger: Logger used for request and response logging for this sandbox. Accepts any standard library `logging.Logger`. When omitted, no request/response logging is emitted.
+        :param on_resume: `"restore"` (the default) restores the memory snapshot; `"reboot"`
+            cold-boots from disk state, so writes not flushed before the pause may be lost.
+            Rejected where filesystem-only resume is not enabled; a no-op for a snapshot
+            without memory or a sandbox that is already running. A value outside the two
+            literals raises `InvalidArgumentException`.
+            Needs a control plane that knows this option: UCloud Sandbox Cloud, or a self-hosted or BYOC
+            deployment built from `e2b-dev/runtime` at or after the commit that added the `memory`
+            field to connect/resume (2026-08-20). An older control plane drops the field and
+            restores memory while answering as if the request had succeeded.
         :return: A running sandbox instance
 
         @example
@@ -295,6 +342,8 @@ class Sandbox(SandboxApi):
     def connect(
         self,
         timeout: Optional[int] = None,
+        *,
+        on_resume: SandboxOnResume = "restore",
         **opts: Unpack[ApiParams],
     ) -> Self:
         """
@@ -305,6 +354,15 @@ class Sandbox(SandboxApi):
 
         :param timeout: Timeout for the sandbox in **seconds**.
             For running sandboxes, the timeout will update only if the new timeout is longer than the existing one.
+        :param on_resume: `"restore"` (the default) restores the memory snapshot; `"reboot"`
+            cold-boots from disk state, so writes not flushed before the pause may be lost.
+            Rejected where filesystem-only resume is not enabled; a no-op for a snapshot
+            without memory or a sandbox that is already running. A value outside the two
+            literals raises `InvalidArgumentException`.
+            Needs a control plane that knows this option: UCloud Sandbox Cloud, or a self-hosted or BYOC
+            deployment built from `e2b-dev/runtime` at or after the commit that added the `memory`
+            field to connect/resume (2026-08-20). An older control plane drops the field and
+            restores memory while answering as if the request had succeeded.
         :return: A running sandbox instance
 
         @example
@@ -323,10 +381,128 @@ class Sandbox(SandboxApi):
         SandboxApi._cls_connect(
             sandbox_id=self.sandbox_id,
             timeout=timeout,
+            on_resume=on_resume,
             **self.connection_config.get_api_params(**opts),
         )
 
         return self
+
+    @overload
+    def fork(
+        self,
+        timeout: Optional[int] = None,
+        count: Optional[int] = None,
+        **opts: Unpack[ApiParams],
+    ) -> List[Union[Self, Exception]]:
+        """
+        Fork the sandbox.
+
+        The sandbox is checkpointed in place (briefly paused, snapshotted with
+        its full memory state, and resumed — its ID and expiration stay
+        untouched) and `count` new sandboxes are created from that snapshot.
+        All forks boot from the same snapshot, so the snapshot is captured once
+        regardless of count.
+
+        Each fork succeeds or fails independently — the returned list contains
+        one entry per requested fork, either a running `Sandbox` instance
+        or an exception describing why that fork failed to start. Per-fork
+        error codes map to the same exception classes as other API errors
+        (e.g. 429 to `RateLimitException`).
+
+        :param timeout: Timeout for the forked sandboxes in **seconds**, defaults to 300 seconds
+        :param count: Number of forked sandboxes to create, defaults to 1
+
+        :return: List with one entry per requested fork — a sandbox instance or an exception
+
+        @example
+        ```python
+        sandbox = Sandbox.create()
+
+        fork1, fork2 = sandbox.fork(count=2)
+        ```
+        """
+        ...
+
+    @overload
+    @staticmethod
+    def fork(
+        sandbox_id: str,
+        timeout: Optional[int] = None,
+        count: Optional[int] = None,
+        logger: Optional[logging.Logger] = None,
+        **opts: Unpack[ApiParams],
+    ) -> List[Union["Sandbox", Exception]]:
+        """
+        Fork a running sandbox specified by sandbox ID.
+
+        The sandbox is checkpointed in place (briefly paused, snapshotted with
+        its full memory state, and resumed — its ID and expiration stay
+        untouched) and `count` new sandboxes are created from that snapshot.
+        All forks boot from the same snapshot, so the snapshot is captured once
+        regardless of count.
+
+        Each fork succeeds or fails independently — the returned list contains
+        one entry per requested fork, either a running `Sandbox` instance
+        or an exception describing why that fork failed to start. Per-fork
+        error codes map to the same exception classes as other API errors
+        (e.g. 429 to `RateLimitException`).
+
+        :param sandbox_id: Sandbox ID
+        :param timeout: Timeout for the forked sandboxes in **seconds**, defaults to 300 seconds
+        :param count: Number of forked sandboxes to create, defaults to 1
+        :param logger: Logger used for request and response logging for the forked sandboxes. Accepts any standard library `logging.Logger`. When omitted, no request/response logging is emitted.
+
+        :return: List with one entry per requested fork — a sandbox instance or an exception
+
+        @example
+        ```python
+        sandbox = Sandbox.create()
+
+        fork1, fork2 = Sandbox.fork(sandbox.sandbox_id, count=2)
+        ```
+        """
+        ...
+
+    @class_method_variant("_cls_fork_sandbox")
+    def fork(
+        self,
+        timeout: Optional[int] = None,
+        count: Optional[int] = None,
+        **opts: Unpack[ApiParams],
+    ) -> List[Union[Self, Exception]]:
+        """
+        Fork the sandbox.
+
+        The sandbox is checkpointed in place (briefly paused, snapshotted with
+        its full memory state, and resumed — its ID and expiration stay
+        untouched) and `count` new sandboxes are created from that snapshot.
+        All forks boot from the same snapshot, so the snapshot is captured once
+        regardless of count.
+
+        Each fork succeeds or fails independently — the returned list contains
+        one entry per requested fork, either a running `Sandbox` instance
+        or an exception describing why that fork failed to start. Per-fork
+        error codes map to the same exception classes as other API errors
+        (e.g. 429 to `RateLimitException`).
+
+        :param timeout: Timeout for the forked sandboxes in **seconds**, defaults to 300 seconds
+        :param count: Number of forked sandboxes to create, defaults to 1
+
+        :return: List with one entry per requested fork — a sandbox instance or an exception
+
+        @example
+        ```python
+        sandbox = Sandbox.create()
+
+        fork1, fork2 = sandbox.fork(count=2)
+        ```
+        """
+        return type(self)._cls_fork_sandbox(
+            self.sandbox_id,
+            timeout=timeout,
+            count=count,
+            **self.connection_config.get_api_params(**opts),
+        )
 
     def __enter__(self):
         return self
@@ -608,10 +784,13 @@ class Sandbox(SandboxApi):
     @overload
     def pause(
         self,
+        keep_memory: bool = True,
         **opts: Unpack[ApiParams],
     ) -> bool:
         """
         Pause the sandbox.
+
+        :param keep_memory: When `False`, the in-memory state is dropped and only the filesystem is persisted (no memory snapshot); resuming such a sandbox cold-boots (reboots) it from disk. Defaults to `True`.
 
         :return: `True` if the sandbox got paused, `False` if the sandbox was already paused
         """
@@ -621,12 +800,14 @@ class Sandbox(SandboxApi):
     @staticmethod
     def pause(
         sandbox_id: str,
+        keep_memory: bool = True,
         **opts: Unpack[ApiParams],
     ) -> bool:
         """
         Pause the sandbox specified by sandbox ID.
 
         :param sandbox_id: Sandbox ID
+        :param keep_memory: When `False`, the in-memory state is dropped and only the filesystem is persisted (no memory snapshot); resuming such a sandbox cold-boots (reboots) it from disk. Defaults to `True`.
 
         :return: `True` if the sandbox got paused, `False` if the sandbox was already paused
         """
@@ -635,22 +816,27 @@ class Sandbox(SandboxApi):
     @class_method_variant("_cls_pause")
     def pause(
         self,
+        keep_memory: bool = True,
         **opts: Unpack[ApiParams],
     ) -> bool:
         """
         Pause the sandbox.
+
+        :param keep_memory: When `False`, the in-memory state is dropped and only the filesystem is persisted (no memory snapshot); resuming such a sandbox cold-boots (reboots) it from disk, losing running processes and open connections. Defaults to `True` (full memory snapshot).
 
         :return: `True` if the sandbox got paused, `False` if the sandbox was already paused
         """
 
         return SandboxApi._cls_pause(
             sandbox_id=self.sandbox_id,
+            keep_memory=keep_memory,
             **self.connection_config.get_api_params(**opts),
         )
 
     @overload
     def beta_pause(
         self,
+        keep_memory: bool = True,
         **opts: Unpack[ApiParams],
     ) -> bool: ...
 
@@ -658,12 +844,14 @@ class Sandbox(SandboxApi):
     @staticmethod
     def beta_pause(
         sandbox_id: str,
+        keep_memory: bool = True,
         **opts: Unpack[ApiParams],
     ) -> bool: ...
 
     @class_method_variant("_cls_pause")
     def beta_pause(
         self,
+        keep_memory: bool = True,
         **opts: Unpack[ApiParams],
     ) -> bool:
         """
@@ -671,7 +859,7 @@ class Sandbox(SandboxApi):
 
         :return: `True` if the sandbox got paused, `False` if the sandbox was already paused
         """
-        return self.pause(**opts)
+        return self.pause(keep_memory=keep_memory, **opts)
 
     @overload
     def create_snapshot(
@@ -743,6 +931,7 @@ class Sandbox(SandboxApi):
         self,
         limit: Optional[int] = None,
         next_token: Optional[str] = None,
+        name: Optional[str] = None,
         **opts: Unpack[ApiParams],
     ) -> SnapshotPaginator:
         """
@@ -750,6 +939,7 @@ class Sandbox(SandboxApi):
 
         :param limit: Maximum number of snapshots to return per page
         :param next_token: Token for pagination
+        :param name: Filter snapshots by name or ID, optionally tag-qualified (e.g. "my-snapshot", "my-project/my-snapshot" or "my-snapshot:v1")
 
         :return: Paginator for listing snapshots
         """
@@ -761,6 +951,7 @@ class Sandbox(SandboxApi):
         sandbox_id: Optional[str] = None,
         limit: Optional[int] = None,
         next_token: Optional[str] = None,
+        name: Optional[str] = None,
         **opts: Unpack[ApiParams],
     ) -> SnapshotPaginator:
         """
@@ -769,6 +960,7 @@ class Sandbox(SandboxApi):
         :param sandbox_id: Filter snapshots by source sandbox ID
         :param limit: Maximum number of snapshots to return per page
         :param next_token: Token for pagination
+        :param name: Filter snapshots by name or ID, optionally tag-qualified (e.g. "my-snapshot", "my-project/my-snapshot" or "my-snapshot:v1")
 
         :return: Paginator for listing snapshots
         """
@@ -779,6 +971,7 @@ class Sandbox(SandboxApi):
         self,
         limit: Optional[int] = None,
         next_token: Optional[str] = None,
+        name: Optional[str] = None,
         **opts: Unpack[ApiParams],
     ) -> SnapshotPaginator:
         """
@@ -786,32 +979,38 @@ class Sandbox(SandboxApi):
 
         :param limit: Maximum number of snapshots to return per page
         :param next_token: Token for pagination
+        :param name: Filter snapshots by name or ID, optionally tag-qualified (e.g. "my-snapshot", "my-project/my-snapshot" or "my-snapshot:v1")
 
         :return: Paginator for listing snapshots
         """
         return SnapshotPaginator(
             sandbox_id=self.sandbox_id,
+            name=name,
             limit=limit,
             next_token=next_token,
             **self.connection_config.get_api_params(**opts),
         )
 
-    @staticmethod
+    @classmethod
     def _cls_list_snapshots(
+        cls,
         sandbox_id: Optional[str] = None,
         limit: Optional[int] = None,
         next_token: Optional[str] = None,
+        name: Optional[str] = None,
         **opts: Unpack[ApiParams],
     ) -> SnapshotPaginator:
         return SnapshotPaginator(
             sandbox_id=sandbox_id,
+            name=name,
             limit=limit,
             next_token=next_token,
-            **opts,
+            **cls._resolve_api_params(**opts),
         )
 
-    @staticmethod
+    @classmethod
     def delete_snapshot(
+        cls,
         snapshot_id: str,
         **opts: Unpack[ApiParams],
     ) -> bool:
@@ -821,7 +1020,7 @@ class Sandbox(SandboxApi):
         :param snapshot_id: Snapshot ID
         :return: `True` if the snapshot was deleted, `False` if it was not found
         """
-        return SandboxApi._cls_delete_snapshot(
+        return cls._cls_delete_snapshot(
             snapshot_id=snapshot_id,
             **opts,
         )
@@ -841,9 +1040,13 @@ class Sandbox(SandboxApi):
         cls,
         sandbox_id: str,
         timeout: Optional[int] = None,
+        logger: Optional[logging.Logger] = None,
+        *,
+        on_resume: SandboxOnResume = "restore",
         **opts: Unpack[ApiParams],
     ) -> Self:
-        debug = ConnectionConfig(**opts).debug
+        params = cls._resolve_api_params(**opts)
+        debug = ConnectionConfig(**params).debug
         if debug:
             sandbox_domain = None
             envd_version = ENVD_DEBUG_FALLBACK
@@ -853,7 +1056,9 @@ class Sandbox(SandboxApi):
             sandbox = SandboxApi._cls_connect(
                 sandbox_id=sandbox_id,
                 timeout=timeout,
-                **opts,
+                on_resume=on_resume,
+                logger=logger,
+                **params,
             )
 
             sandbox_id = sandbox.sandbox_id
@@ -866,12 +1071,13 @@ class Sandbox(SandboxApi):
             "E2b-Sandbox-Id": sandbox_id,
             "E2b-Sandbox-Port": str(ConnectionConfig.envd_port),
         }
-        if envd_access_token is not None:
+        if envd_access_token is not None and not isinstance(envd_access_token, Unset):
             sandbox_headers["X-Access-Token"] = envd_access_token
 
         connection_config = ConnectionConfig(
             extra_sandbox_headers=sandbox_headers,
-            **opts,
+            logger=logger,
+            **params,
         )
 
         return cls(
@@ -884,6 +1090,56 @@ class Sandbox(SandboxApi):
         )
 
     @classmethod
+    def _cls_fork_sandbox(
+        cls,
+        sandbox_id: str,
+        timeout: Optional[int] = None,
+        count: Optional[int] = None,
+        logger: Optional[logging.Logger] = None,
+        **opts: Unpack[ApiParams],
+    ) -> List[Union[Self, Exception]]:
+        params = cls._resolve_api_params(**opts)
+        responses = SandboxApi._cls_fork(
+            sandbox_id=sandbox_id,
+            timeout=timeout,
+            count=count,
+            logger=logger,
+            **params,
+        )
+
+        sandboxes: List[Union[Self, Exception]] = []
+        for response in responses:
+            if isinstance(response, Exception):
+                sandboxes.append(response)
+                continue
+
+            sandbox_headers = {
+                "E2b-Sandbox-Id": response.sandbox_id,
+                "E2b-Sandbox-Port": str(ConnectionConfig.envd_port),
+            }
+            if response.envd_access_token is not None:
+                sandbox_headers["X-Access-Token"] = response.envd_access_token
+
+            connection_config = ConnectionConfig(
+                extra_sandbox_headers=sandbox_headers,
+                logger=logger,
+                **params,
+            )
+
+            sandboxes.append(
+                cls(
+                    sandbox_id=response.sandbox_id,
+                    sandbox_domain=response.sandbox_domain,
+                    envd_version=Version(response.envd_version),
+                    envd_access_token=response.envd_access_token,
+                    traffic_access_token=response.traffic_access_token,
+                    connection_config=connection_config,
+                )
+            )
+
+        return sandboxes
+
+    @classmethod
     def _create(
         cls,
         template: Optional[str],
@@ -894,13 +1150,16 @@ class Sandbox(SandboxApi):
         allow_internet_access: bool,
         mcp: Optional[McpServer] = None,
         network: Optional[SandboxNetworkOpts] = None,
+        iam: Optional[SandboxIamOpts] = None,
         lifecycle: Optional[SandboxLifecycle] = None,
         volume_mounts: Optional[list] = None,
+        logger: Optional[logging.Logger] = None,
         **opts: Unpack[ApiParams],
     ) -> Self:
+        params = cls._resolve_api_params(**opts)
         extra_sandbox_headers = {}
 
-        debug = ConnectionConfig(**opts).debug
+        debug = ConnectionConfig(**params).debug
         if debug:
             sandbox_id = "debug_sandbox_id"
             sandbox_domain = None
@@ -917,9 +1176,11 @@ class Sandbox(SandboxApi):
                 allow_internet_access=allow_internet_access,
                 mcp=mcp,
                 network=network,
+                iam=iam,
                 lifecycle=lifecycle,
                 volume_mounts=volume_mounts,
-                **opts,
+                logger=logger,
+                **params,
             )
 
             sandbox_id = response.sandbox_id
@@ -928,7 +1189,9 @@ class Sandbox(SandboxApi):
             envd_access_token = response.envd_access_token
             traffic_access_token = response.traffic_access_token
 
-            if envd_access_token is not None:
+            if envd_access_token is not None and not isinstance(
+                envd_access_token, Unset
+            ):
                 extra_sandbox_headers["X-Access-Token"] = envd_access_token
 
         extra_sandbox_headers["E2b-Sandbox-Id"] = sandbox_id
@@ -936,7 +1199,8 @@ class Sandbox(SandboxApi):
 
         connection_config = ConnectionConfig(
             extra_sandbox_headers=extra_sandbox_headers,
-            **opts,
+            logger=logger,
+            **params,
         )
 
         return cls(

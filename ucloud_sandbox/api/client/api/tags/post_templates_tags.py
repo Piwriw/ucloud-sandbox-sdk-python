@@ -49,6 +49,10 @@ def _parse_response(
         response_404 = Error.from_dict(response.json())
 
         return response_404
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -75,7 +79,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: AssignTemplateTagsRequest,
 ) -> Response[Union[AssignedTemplateTags, Error]]:
-    """Assign tag(s) to a template build
+    """Assign template tags
+
+     Assign tag(s) to a template build
 
     Args:
         body (AssignTemplateTagsRequest):
@@ -104,7 +110,9 @@ def sync(
     client: AuthenticatedClient,
     body: AssignTemplateTagsRequest,
 ) -> Optional[Union[AssignedTemplateTags, Error]]:
-    """Assign tag(s) to a template build
+    """Assign template tags
+
+     Assign tag(s) to a template build
 
     Args:
         body (AssignTemplateTagsRequest):
@@ -128,7 +136,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: AssignTemplateTagsRequest,
 ) -> Response[Union[AssignedTemplateTags, Error]]:
-    """Assign tag(s) to a template build
+    """Assign template tags
+
+     Assign tag(s) to a template build
 
     Args:
         body (AssignTemplateTagsRequest):
@@ -155,7 +165,9 @@ async def asyncio(
     client: AuthenticatedClient,
     body: AssignTemplateTagsRequest,
 ) -> Optional[Union[AssignedTemplateTags, Error]]:
-    """Assign tag(s) to a template build
+    """Assign template tags
+
+     Assign tag(s) to a template build
 
     Args:
         body (AssignTemplateTagsRequest):

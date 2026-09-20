@@ -23,11 +23,11 @@ UPSTREAM_PYPROJECTS = [
     ("e2b", REPO_ROOT / "upstream/e2b/packages/python-sdk/pyproject.toml"),
     (
         "code-interpreter",
-        REPO_ROOT / "upstream/code-interpreter/python/pyproject.toml",
+        REPO_ROOT / "upstream/e2b/packages/code-interpreter-python/pyproject.toml",
     ),
     (
         "desktop",
-        REPO_ROOT / "upstream/desktop/packages/python-sdk/pyproject.toml",
+        REPO_ROOT / "upstream/e2b/packages/desktop-python/pyproject.toml",
     ),
 ]
 
@@ -35,9 +35,15 @@ SKIP_RUNTIME_DEPENDENCIES = {
     "e2b",
 }
 
+# Upstream dependency groups that only serve E2B's own code generation
+# toolchain; this project never runs `make generate-*`.
+SKIP_DEV_GROUPS = {
+    "codegen",
+}
+
 RUNTIME_OVERRIDES = {
     "python": "^3.10",
-    "httpx": ">=0.27.0, <1.0.0",
+    "httpx": ">=0.27.0,<1.0.0",
     "attrs": ">=23.2.0",
     "pillow": "^12.0.0",
 }
@@ -53,8 +59,9 @@ RUNTIME_ORDER = [
     "python",
     "python-dateutil",
     "wcmatch",
-    "protobuf",
-    "httpcore",
+    "protobuf-py",
+    "connectrpc",
+    "pyqwest",
     "httpx",
     "h2",
     "attrs",
@@ -72,8 +79,6 @@ DEV_ORDER = [
     "python-dotenv",
     "pytest-dotenv",
     "pytest-asyncio",
-    "pydoc-markdown",
-    "datamodel-code-generator",
     "ruff",
     "pytest-timeout",
     "ty",
@@ -90,18 +95,77 @@ def load_pyproject(path: Path) -> dict[str, Any]:
         return tomllib.load(file)
 
 
-def poetry_dependencies(pyproject: dict[str, Any]) -> dict[str, Any]:
-    return pyproject.get("tool", {}).get("poetry", {}).get("dependencies", {})
+# PEP 508 requirement, e.g. `wcmatch>=10.1,<12` or `protobuf-py>=0.1.1,<0.2`.
+# Upstream migrated to uv/PEP 621, so dependencies arrive as strings rather than
+# the `name = constraint` tables Poetry uses.
+REQUIREMENT_PATTERN = re.compile(
+    r"""
+    ^\s*
+    (?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)
+    (?:\[(?P<extras>[^\]]*)\])?
+    \s*
+    (?P<constraint>[^;]*?)
+    \s*
+    (?:;(?P<marker>.*))?
+    $
+    """,
+    re.VERBOSE,
+)
 
 
-def poetry_dev_dependencies(pyproject: dict[str, Any]) -> dict[str, Any]:
-    return (
-        pyproject.get("tool", {})
-        .get("poetry", {})
-        .get("group", {})
-        .get("dev", {})
-        .get("dependencies", {})
-    )
+def parse_requirement(source_name: str, requirement: str) -> tuple[str, str]:
+    match = REQUIREMENT_PATTERN.match(requirement)
+    if not match:
+        print(
+            f"Cannot parse {source_name} requirement: {requirement!r}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    # Poetry needs a table instead of a plain version string for these, so fail
+    # loudly rather than silently dropping them.
+    for field in ("extras", "marker"):
+        if match.group(field):
+            print(
+                f"Unsupported {field} in {source_name} requirement: {requirement!r}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    return match.group("name"), match.group("constraint") or "*"
+
+
+def project_dependencies(
+    source_name: str, pyproject: dict[str, Any]
+) -> dict[str, Any]:
+    project = pyproject.get("project", {})
+    dependencies = {
+        name: constraint
+        for name, constraint in (
+            parse_requirement(source_name, requirement)
+            for requirement in project.get("dependencies", [])
+        )
+    }
+
+    requires_python = project.get("requires-python")
+    if requires_python:
+        dependencies["python"] = requires_python
+
+    return dependencies
+
+
+def project_dev_dependencies(
+    source_name: str, pyproject: dict[str, Any]
+) -> dict[str, Any]:
+    groups = pyproject.get("dependency-groups", {})
+    return {
+        name: constraint
+        for group, requirements in groups.items()
+        if group not in SKIP_DEV_GROUPS
+        for name, constraint in (
+            parse_requirement(source_name, requirement) for requirement in requirements
+        )
+    }
 
 
 def merge_dependencies(
@@ -198,7 +262,7 @@ def main() -> int:
 
     runtime_dependencies = merge_dependencies(
         [
-            (source_name, poetry_dependencies(pyproject))
+            (source_name, project_dependencies(source_name, pyproject))
             for source_name, pyproject in upstream
         ],
         skip=SKIP_RUNTIME_DEPENDENCIES,
@@ -206,7 +270,7 @@ def main() -> int:
     )
     dev_dependencies = merge_dependencies(
         [
-            (source_name, poetry_dev_dependencies(pyproject))
+            (source_name, project_dev_dependencies(source_name, pyproject))
             for source_name, pyproject in upstream
         ],
         overrides=DEV_OVERRIDES,
