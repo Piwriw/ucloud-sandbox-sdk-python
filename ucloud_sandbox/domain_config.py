@@ -9,8 +9,8 @@ REGION_ENV_VAR = "UCLOUD_SANDBOX_REGION"
 DOMAIN_ENV_VAR = "UCLOUD_SANDBOX_DOMAIN"
 DOMAIN_SUFFIX = "sandbox.ucloudai.com"
 
-CN_BASE_IMAGE = "uhub.service.ucloud.cn/agent-sandbox/base:cn"
-DEFAULT_BASE_IMAGE = "uhub.service.ucloud.cn/agent-sandbox/base:latest"
+CN_BASE_IMAGE = "uhub.service.ucloud.cn/agent-sandbox-public/base_cn:latest"
+DEFAULT_BASE_IMAGE = "uhub.service.ucloud.cn/agent-sandbox-public/base:latest"
 CN_REGION_PREFIXES = ("cn", "gray")
 
 
