@@ -90,6 +90,64 @@ CLIENT_IDENTIFIER_REPLACEMENTS = [
     (r":class:`E2B`", f":class:`{CLIENT_CLASS}`"),
 ]
 
+# UCloud Sandbox serves built-in templates under the `system/` namespace.
+# Sandboxes created without an explicit template default to the prefixed name,
+# while template builder guards accept both the bare and the prefixed name.
+SYSTEM_TEMPLATE_PREFIX = "system/"
+
+
+def _default_template_rule(attr: str, name: str) -> tuple[str, str, int]:
+    return (
+        f'{attr} = "{name}"\n',
+        f'{attr} = "{SYSTEM_TEMPLATE_PREFIX}{name}"\n',
+        1,
+    )
+
+
+def _default_template_doc_rule(name: str) -> tuple[str, str, int]:
+    return (
+        f"from the default `{name}` sandbox template",
+        f"from the default `{SYSTEM_TEMPLATE_PREFIX}{name}` sandbox template",
+        1,
+    )
+
+
+def _base_template_guard_rule(name: str, count: int) -> tuple[str, str, int]:
+    return (
+        f'        if self._template._base_template != "{name}":\n',
+        "        if self._template._base_template not in (\n"
+        f'            "{name}",\n'
+        f'            "{SYSTEM_TEMPLATE_PREFIX}{name}",\n'
+        "        ):\n",
+        count,
+    )
+
+
+# path -> [(old, new, expected occurrences of old in upstream)]
+SYSTEM_TEMPLATE_REPLACEMENTS = {
+    PACKAGE_DIR / "sandbox" / "main.py": [
+        _default_template_rule("    default_template", "base"),
+        _default_template_rule("    default_mcp_template", "mcp-gateway"),
+    ],
+    PACKAGE_DIR / "sandbox_sync" / "main.py": [
+        _default_template_doc_rule("base"),
+    ],
+    PACKAGE_DIR / "sandbox_async" / "main.py": [
+        _default_template_doc_rule("base"),
+    ],
+    PACKAGE_DIR / "code_interpreter" / "constants.py": [
+        _default_template_rule("DEFAULT_TEMPLATE", "code-interpreter-v1"),
+    ],
+    PACKAGE_DIR / "desktop" / "main.py": [
+        _default_template_rule("    default_template", "desktop"),
+        _default_template_doc_rule("desktop"),
+    ],
+    PACKAGE_DIR / "template" / "main.py": [
+        _base_template_guard_rule("mcp-gateway", 1),
+        _base_template_guard_rule("devcontainer", 2),
+    ],
+}
+
 ENV_REPLACEMENTS = {
     "E2B_MAX_KEEPALIVE_CONNECTIONS": "UCLOUD_SANDBOX_MAX_KEEPALIVE_CONNECTIONS",
     "E2B_KEEPALIVE_EXPIRY": "UCLOUD_SANDBOX_KEEPALIVE_EXPIRY",
@@ -263,6 +321,20 @@ def patch_template_base_image(path: Path, text: str) -> str:
         f'        self._default_base_image: str = "{DEFAULT_BASE_IMAGE}"\n',
         "        self._default_base_image: str = get_default_base_image()\n",
     )
+    return text
+
+
+def patch_system_templates(path: Path, text: str) -> str:
+    """Prefix built-in template names with the `system/` namespace."""
+    for old, new, count in SYSTEM_TEMPLATE_REPLACEMENTS.get(path, []):
+        if old not in text and text.count(new) == count:
+            continue
+        if text.count(old) != count:
+            raise RuntimeError(
+                f"Expected {count} occurrence(s) of patch anchor in {path}, "
+                f"found {text.count(old)}: {old!r}"
+            )
+        text = text.replace(old, new)
     return text
 
 
@@ -644,6 +716,7 @@ def patch_file(path: Path) -> bool:
     text = patch_connection_config(path, text)
     text = patch_insecure_http(path, text)
     text = patch_template_base_image(path, text)
+    text = patch_system_templates(path, text)
     text = patch_domain_config_exports(path, text)
 
     for header, placeholder in PROTOCOL_HEADERS.items():

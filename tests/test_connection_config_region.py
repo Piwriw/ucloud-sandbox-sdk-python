@@ -1,5 +1,6 @@
 import inspect
 
+import pytest
 from packaging.version import Version
 
 from ucloud_sandbox.code_interpreter import code_interpreter_async, code_interpreter_sync
@@ -11,7 +12,9 @@ from ucloud_sandbox.domain_config import (
     get_ucloud_sandbox_domain,
     is_region_cn,
 )
+from ucloud_sandbox.exceptions import BuildException
 from ucloud_sandbox.sandbox.main import SandboxBase
+from ucloud_sandbox.template_sync.main import Template
 from ucloud_sandbox.volume.connection_config import VolumeConnectionConfig
 from ucloud_sandbox.volume.volume_async import AsyncVolume
 from ucloud_sandbox.volume.volume_sync import Volume
@@ -209,3 +212,29 @@ def test_volume_instances_preserve_insecure_http_setting(monkeypatch):
 
     assert volume._get_volume_config().api_url == "http://api.private.example"
     assert async_volume._get_volume_config().api_url == "http://api.private.example"
+
+
+def test_builtin_templates_use_system_namespace():
+    assert SandboxBase.default_template == "system/base"
+    assert SandboxBase.default_mcp_template == "system/mcp-gateway"
+    assert code_interpreter_sync.Sandbox.default_template == "system/code-interpreter-v1"
+    assert code_interpreter_async.AsyncSandbox.default_template == "system/code-interpreter-v1"
+    assert desktop_main.Sandbox.default_template == "system/desktop"
+
+
+@pytest.mark.parametrize("base", ["mcp-gateway", "system/mcp-gateway"])
+def test_mcp_server_accepts_bare_and_system_template(base):
+    Template().from_template(base).add_mcp_server("exa")
+
+
+@pytest.mark.parametrize("base", ["devcontainer", "system/devcontainer"])
+def test_devcontainer_accepts_bare_and_system_template(base):
+    Template().from_template(base).beta_dev_container_prebuild("/app")
+    Template().from_template(base).beta_set_dev_container_start("/app")
+
+
+def test_template_guards_still_reject_other_templates():
+    with pytest.raises(BuildException):
+        Template().from_template("system/base").add_mcp_server("exa")
+    with pytest.raises(BuildException):
+        Template().from_template("system/base").beta_dev_container_prebuild("/app")

@@ -29,8 +29,8 @@ class SandboxBase(ClientFactory):
 
     default_sandbox_timeout = 300
 
-    default_template = "base"
-    default_mcp_template = "mcp-gateway"
+    default_template = "system/base"
+    default_mcp_template = "system/mcp-gateway"
 
     def __init__(
         self,

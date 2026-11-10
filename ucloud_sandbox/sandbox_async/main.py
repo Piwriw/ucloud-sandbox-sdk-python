@@ -188,7 +188,7 @@ class AsyncSandbox(SandboxApi):
         """
         Create a new sandbox.
 
-        By default, the sandbox is created from the default `base` sandbox template.
+        By default, the sandbox is created from the default `system/base` sandbox template.
 
         :param template: Sandbox template name or ID
         :param timeout: Timeout for the sandbox in **seconds**, default to 300 seconds. The maximum time a sandbox can be kept alive is 24 hours (86_400 seconds) for Pro users and 1 hour (3_600 seconds) for Hobby users.

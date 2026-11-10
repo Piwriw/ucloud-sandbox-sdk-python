@@ -503,7 +503,10 @@ class TemplateBuilder:
         template.add_mcp_server(['brave', 'firecrawl', 'duckduckgo'])
         ```
         """
-        if self._template._base_template != "mcp-gateway":
+        if self._template._base_template not in (
+            "mcp-gateway",
+            "system/mcp-gateway",
+        ):
             caller_frame = get_caller_frame()
             stack_trace = make_traceback(caller_frame)
             raise BuildException(
@@ -568,7 +571,10 @@ class TemplateBuilder:
         template.beta_dev_container_prebuild('/my-devcontainer')
         ```
         """
-        if self._template._base_template != "devcontainer":
+        if self._template._base_template not in (
+            "devcontainer",
+            "system/devcontainer",
+        ):
             caller_frame = get_caller_frame()
             stack_trace = make_traceback(caller_frame)
             raise BuildException(
@@ -605,7 +611,10 @@ class TemplateBuilder:
         template.beta_set_dev_container_start('/my-devcontainer')
         ```
         """
-        if self._template._base_template != "devcontainer":
+        if self._template._base_template not in (
+            "devcontainer",
+            "system/devcontainer",
+        ):
             caller_frame = get_caller_frame()
             stack_trace = make_traceback(caller_frame)
             raise BuildException(

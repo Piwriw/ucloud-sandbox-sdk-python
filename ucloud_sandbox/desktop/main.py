@@ -207,7 +207,7 @@ class _VNCServer:
 
 
 class Sandbox(SandboxBase):
-    default_template = "desktop"
+    default_template = "system/desktop"
     __vnc_server: _VNCServer
     _last_xfce4_pid: Optional[str] = None
     _display: str
@@ -234,7 +234,7 @@ class Sandbox(SandboxBase):
         """
         Create a new sandbox.
 
-        By default, the sandbox is created from the default `desktop` sandbox template.
+        By default, the sandbox is created from the default `system/desktop` sandbox template.
 
 
         :param template: Sandbox template name or ID

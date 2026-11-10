@@ -86,6 +86,7 @@ python3 scripts/hack.py
 - 将 `publisher` 改成 `ucloud`。
 - 将 User-Agent 改成 `ucloud-agentbox-sdk/{package_version}`。
 - 将默认 base image 按 region 解析：`ucloud_sandbox/template/main.py` 的 `_default_base_image` 改为调用 `get_default_base_image()`，CN region（`cn`、`gray` 前缀）使用 `uhub.service.ucloud.cn/agent-sandbox-public/base_cn:latest`，其余使用 `uhub.service.ucloud.cn/agent-sandbox-public/base:latest`。上游代码里残留的 `e2bdev/base` 文案也一并替换成后者。
+- 默认创建沙箱时使用带 `system/` 前缀的内置 template：未显式传 `template` 时，`base`、`mcp-gateway`、`code-interpreter-v1`、`desktop` 分别变为 `system/base`、`system/mcp-gateway`、`system/code-interpreter-v1`、`system/desktop`。用户显式传入不带前缀的名字不受影响；`template/main.py` 中 `add_mcp_server` 和 devcontainer 相关方法对 base template 的检查同时接受 `mcp-gateway` / `system/mcp-gateway` 和 `devcontainer` / `system/devcontainer`。替换规则集中在 `scripts/hack.py` 的 `SYSTEM_TEMPLATE_REPLACEMENTS`，每条规则带预期匹配次数，次数不符会直接报错。
 - 保留协议 header `E2B-Traffic-Access-Token` 和 `X-E2B-Trace-ID` 不变，因为它们属于服务端兼容协议，不是品牌文案。脚本通过占位符机制保护这些 header。
 
 验证 hack 是否成功时，至少要做下面几类检查：
